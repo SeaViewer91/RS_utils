@@ -2,11 +2,13 @@ import PySimpleGUI as sg
 
 
 def main():
+    # Main Window의 Layout
     Layout = [
         [sg.Button('DMS to Deg', size=(20, 5), font=15), sg.Button('Deg to DMS', size=(20, 5), font=15)],
         [sg.Text('v1.0 by S.H.Bak')]
     ]
 
+    # DMS to Deg 기능의 Layout
     LayoutDMS2Deg = [
         [sg.Text('Deg : '), sg.InputText(key='-getDeg-')],
         [sg.Text('Min : '), sg.InputText(key='-getMin-')],
@@ -14,6 +16,7 @@ def main():
         [sg.Button('Transform'), sg.InputText(key='-DispDeg-')]
     ]
 
+    # Deg to DMS 기능의 Layout
     LayoutDeg2DMS = [
         [sg.Text('Degree : '), sg.InputText(key='-getDeg-'), sg.Button('Transform')],
         [sg.Text('Deg : '), sg.InputText(key='-DispDeg-')],
