@@ -1,0 +1,13 @@
+{
+  "Styrofoam_Box": 0,
+  "Styrofoam_Buoy": 1,
+  "Styrofoam_Piece": 2,
+  "PET_Bottle": 3,
+  "Glass": 4,
+  "Metal": 5,
+  "Plastic_Buoy": 6,
+  "Plastic_Buoy_China": 7,
+  "Plastic_ETC": 8,
+  "Net": 9,
+  "Rope": 10
+}

@@ -1,0 +1,6 @@
+# Labelme to YOLO requirements
+# Usage : pip install -r requirements.txt
+
+# Base
+tqdm==4.64.1
+pandas==1.3.5
