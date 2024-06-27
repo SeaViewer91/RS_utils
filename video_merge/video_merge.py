@@ -1,3 +1,9 @@
+'''
+디렉토리 내에 존재하는 mov 형식 비디오를 순차적으로 이어붙여 하나의 mp4 파일로 만들어주는 도구
+
+낙동강 환경감시 업무 지원을 위해 개발됨(2024-06-27).
+'''
+
 import os
 import subprocess
 import datetime
