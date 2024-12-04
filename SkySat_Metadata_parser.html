@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JSON Properties Parser</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #e0f7fa, #e1bee7);
+        }
+        #container {
+            text-align: center;
+            width: 90%;
+            max-width: 800px;
+            background: #ffffff;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            color: #00796b;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        #fileInput, #jsonInput, button {
+            width: 90%;
+            margin: 10px 0;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            font-size: 1em;
+        }
+        #fileInput {
+            background-color: #f1f8e9;
+        }
+        button {
+            background-color: #81c784;
+            color: #ffffff;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #66bb6a;
+        }
+        #output {
+            overflow-x: auto;
+            margin-top: 20px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            background-color: #ffffff;
+            padding: 20px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border: 1px solid #e0e0e0;
+        }
+        th {
+            cursor: pointer;
+            background-color: #b2dfdb;
+            color: #004d40;
+        }
+        td {
+            background-color: #f8f9fa;
+        }
+        td:hover {
+            background-color: #a5d6a7;
+        }
+        th.sticky {
+            position: sticky;
+            left: 0;
+            background-color: #80cbc4;
+            z-index: 2;
+        }
+        td.sticky {
+            position: sticky;
+            left: 0;
+            background-color: #f8bbd0;
+            z-index: 1;
+        }
+        td.sticky:hover {
+            background-color: #a5d6a7;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <h1>JSON Properties Parser</h1>
+        <input type="file" id="fileInput" webkitdirectory multiple><br>
+        <button onclick="loadJSONFiles()">Load JSON Files</button><br>
+        <textarea id="jsonInput" placeholder="Paste your JSON here..." rows="5"></textarea><br>
+        <button onclick="parseJSON()">Parse JSON</button>
+        <div id="output"></div>
+        <button onclick="exportCSV()">Export to CSV</button>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        const fileData = {};
+
+        function loadJSONFiles() {
+            const inputElement = document.getElementById('fileInput');
+            const files = inputElement.files;
+
+            if (files.length === 0) {
+                alert('Please select a directory containing JSON files.');
+                return;
+            }
+
+            for (const file of files) {
+                if (file.name.endsWith('.json')) {
+                    const reader = new FileReader();
+                    reader.onload = function(event) {
+                        try {
+                            const jsonObject = JSON.parse(event.target.result);
+                            if (jsonObject.properties) {
+                                const properties = jsonObject.properties;
+                                const fileName = file.name.replace('.json', '');
+                                fileData[fileName] = properties;
+                                displayTable();
+                            }
+                        } catch (error) {
+                            console.error('Invalid JSON in file: ' + file.name);
+                        }
+                    };
+                    reader.readAsText(file);
+                }
+            }
+        }
+
+        function parseJSON() {
+            const input = document.getElementById('jsonInput').value;
+            try {
+                const jsonObject = JSON.parse(input);
+                if (jsonObject.properties) {
+                    const properties = jsonObject.properties;
+                    const fileName = "inputFile"; // Example filename, replace with dynamic filename during actual implementation.
+                    fileData[fileName] = properties;
+                    displayTable();
+                } else {
+                    document.getElementById('output').innerHTML = 'No "properties" field found in the JSON.';
+                }
+            } catch (error) {
+                document.getElementById('output').innerHTML = 'Invalid JSON. Please check the format and try again.';
+            }
+        }
+
+        function displayTable() {
+            let tableHtml = '<table><tr><th class="sticky">Key</th>';
+            for (const fileName in fileData) {
+                tableHtml += `<th>${fileName}</th>`;
+            }
+            tableHtml += '</tr>';
+
+            const allKeys = new Set();
+            for (const fileName in fileData) {
+                Object.keys(fileData[fileName]).forEach(key => allKeys.add(key));
+            }
+
+            allKeys.forEach(key => {
+                tableHtml += `<tr><td class="sticky" onclick="showChart('${key}')">${key}</td>`;
+                for (const fileName in fileData) {
+                    tableHtml += `<td>${fileData[fileName].hasOwnProperty(key) ? fileData[fileName][key] : ''}</td>`;
+                }
+                tableHtml += '</tr>';
+            });
+
+            tableHtml += '</table>';
+            document.getElementById('output').innerHTML = tableHtml;
+        }
+
+        function exportCSV() {
+            let csvContent = "data:text/csv;charset=utf-8,";
+            let headerRow = 'Key';
+            for (const fileName in fileData) {
+                headerRow += `,${fileName}`;
+            }
+            csvContent += headerRow + "\n";
+
+            const allKeys = new Set();
+            for (const fileName in fileData) {
+                Object.keys(fileData[fileName]).forEach(key => allKeys.add(key));
+            }
+
+            allKeys.forEach(key => {
+                let row = `${key}`;
+                for (const fileName in fileData) {
+                    row += `,${fileData[fileName].hasOwnProperty(key) ? fileData[fileName][key] : ''}`;
+                }
+                csvContent += row + "\n";
+            });
+
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", "parsed_properties.csv");
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        function showChart(key) {
+            const labels = [];
+            const values = [];
+            let isNumeric = true;
+
+            for (const fileName in fileData) {
+                labels.push(fileName);
+                const value = fileData[fileName][key];
+                if (isNaN(value)) {
+                    isNumeric = false;
+                }
+                values.push(value);
+            }
+
+            if (!isNumeric) {
+                alert("텍스트형 자료입니다");
+                return;
+            }
+
+            const chartWindow = window.open('', '', 'width=800,height=600');
+            chartWindow.document.write('<html><head><title>Chart</title></head><body><canvas id="chartCanvas"></canvas></body></html>');
+            chartWindow.document.close();
+
+            const chartScript = chartWindow.document.createElement('script');
+            chartScript.src = 'https://cdn.jsdelivr.net/npm/chart.js';
+            chartScript.onload = function() {
+                const ctx = chartWindow.document.getElementById('chartCanvas').getContext('2d');
+                new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: key,
+                            data: values,
+                            backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                            borderColor: 'rgba(75, 192, 192, 1)',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        scales: {
+                            y: {
+                                beginAtZero: true
+                            }
+                        }
+                    }
+                });
+            };
+            chartWindow.document.body.appendChild(chartScript);
+        }
+    </script>
+</body>
+</html>
