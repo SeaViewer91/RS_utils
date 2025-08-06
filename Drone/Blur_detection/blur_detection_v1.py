@@ -124,10 +124,7 @@ class WorkWindow(tk.Toplevel):
         self.user_labels = []  # user‑edited labels
         self.index = 0
 
-        # Keywords for identifying training examples
-        self.blur_keyword = tk.StringVar(value="blur")
-        self.normal_keyword = tk.StringVar(value="normal")
-        # Threshold value used for classification
+        # Threshold value used for classification (string for Entry)
         self.threshold_var = tk.StringVar(value="")
 
         # Load image file list
@@ -199,17 +196,13 @@ class WorkWindow(tk.Toplevel):
         tk.Button(nav_frame, text="Previous", command=self.previous_image).pack(side="left", padx=5)
         tk.Button(nav_frame, text="Next", command=self.next_image).pack(side="left")
 
-        # Parameters frame: blur/normal keywords and threshold entry
+        # Parameters frame: threshold entry only
         param_frame = tk.Frame(bottom_frame)
         param_frame.pack(side="left", padx=10)
-        tk.Label(param_frame, text="Blur Key:").grid(row=0, column=0, sticky="e")
-        tk.Entry(param_frame, textvariable=self.blur_keyword, width=10).grid(row=0, column=1, padx=5)
-        tk.Label(param_frame, text="Normal Key:").grid(row=0, column=2, sticky="e")
-        tk.Entry(param_frame, textvariable=self.normal_keyword, width=10).grid(row=0, column=3, padx=5)
-        tk.Label(param_frame, text="Threshold:").grid(row=1, column=0, sticky="e")
+        tk.Label(param_frame, text="Threshold:").grid(row=0, column=0, sticky="e")
         self.threshold_entry = tk.Entry(param_frame, textvariable=self.threshold_var, width=10)
-        self.threshold_entry.grid(row=1, column=1, padx=5)
-        tk.Button(param_frame, text="Reanalysis", command=self.reanalysis).grid(row=1, column=2, columnspan=2, padx=5)
+        self.threshold_entry.grid(row=0, column=1, padx=5)
+        tk.Button(param_frame, text="Reanalysis", command=self.reanalysis).grid(row=0, column=2, padx=5)
 
         # Finish button
         tk.Button(bottom_frame, text="Finish", command=self.finish_sorting).pack(side="right")
@@ -234,8 +227,9 @@ class WorkWindow(tk.Toplevel):
                 img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
             self.metrics[i] = compute_gradient_variance(img)
         # Determine threshold using training examples
-        blur_keys = self.blur_keyword.get().strip().lower().split(',') if self.blur_keyword.get().strip() else []
-        normal_keys = self.normal_keyword.get().strip().lower().split(',') if self.normal_keyword.get().strip() else []
+        # Keywords for identifying training examples are fixed ('blur' and 'normal')
+        blur_keys = ["blur"]
+        normal_keys = ["normal"]
         blur_vals = []
         normal_vals = []
         for path, metric in zip(self.images, self.metrics):
@@ -278,18 +272,20 @@ class WorkWindow(tk.Toplevel):
 
     def reanalysis(self):
         """Reanalyse using an optional user‑specified threshold, or recompute one."""
+        # Save current user selection
         self.update_user_label()
-        # If user has provided a numeric threshold, use it
         entry_val = self.threshold_var.get().strip()
         try:
             if entry_val:
+                # Use the user supplied threshold if provided
                 threshold = float(entry_val)
             else:
-                # Otherwise compute anew (similar to run_analysis but without recomputing metrics)
-                blur_keys = self.blur_keyword.get().strip().lower().split(',') if self.blur_keyword.get().strip() else []
-                normal_keys = self.normal_keyword.get().strip().lower().split(',') if self.normal_keyword.get().strip() else []
-                blur_vals = []
-                normal_vals = []
+                # Otherwise compute a threshold automatically based on measured metrics
+                # Use fixed keywords ('blur' and 'normal') to identify training examples
+                blur_keys = ["blur"]
+                normal_keys = ["normal"]
+                blur_vals: list[float] = []
+                normal_vals: list[float] = []
                 for path, metric in zip(self.images, self.metrics):
                     if metric is None:
                         continue
@@ -307,13 +303,13 @@ class WorkWindow(tk.Toplevel):
                 else:
                     valid = [m for m in self.metrics if m is not None]
                     threshold = np.median(valid) if valid else 0.0
+                # Update threshold variable with the computed value
                 self.threshold_var.set(f"{threshold:.2f}")
         except ValueError:
             messagebox.showerror("Invalid input", "Threshold must be a number.")
             return
-        # Apply threshold
+        # Apply the threshold and refresh display
         self.apply_threshold(threshold)
-        # Refresh current image display
         self.show_image(self.index)
 
     def update_status(self):
