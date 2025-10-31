@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FG/BG 인터랙티브 샘플링 → 감독분류(SVM/RF) → 모폴로지 후처리 → 외곽 폴리곤(정교) → YOLO-seg Export
+FG/BG 인터랙티브 샘플링 → 감독분류(SVM/RF/MLP) → 모폴로지 후처리 → 정교한 외곽 폴리곤 → YOLO-seg Export
 - 시작 시 폴더 선택 팝업 + Load Images 버튼
-- 모델: SVM(linear/rbf/poly), RF / Epochs 기본 100 (조절 가능), 진행 팝업 표시
+- 모델: SVM(linear/rbf/poly), RF, MLP(PyTorch) / Epochs 기본 100 (조절 가능), 진행 팝업 표시
 - Classify 결과 오버레이 투명도(10~100%), Clear 버튼
 - Export Dataset(CSV: IDX,R,G,B,Cls) / Dataset Load(CSV 불러와 이어서 학습)
 - 줌/팬: Ctrl+휠(줌), Ctrl+클릭(해당 지점을 화면 중앙으로 팬)
 - 모폴로지 기본: 커널 3x3, 열림1, 닫힘1 (Option에서 변경)
 - 컨투어 정교화: CHAIN_APPROX_NONE 기본, epsilon(px)로 단순화 강도 제어(0=끄기),
-  컨투어 추출 전 선택적 블러(가우시안/미디언) + 재이진화 옵션 추가 (Option에서 변경)
+  컨투어 추출 전 선택적 블러(가우시안/미디언) + 재이진화 옵션 (Option에서 설정)
 - YOLO-seg 저장 + 화면에는 붉은색(1px) 경계선 표시
+- MLP: 레이어 수/뉴런 개수/드롭아웃 사용 & rate를 Option에서 제어, *.pt로 저장/로드(구조 포함)
 """
 
 import csv
@@ -30,6 +31,15 @@ from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 import joblib
 
+# ----- PyTorch (MLP) -----
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    TORCH_OK = True
+except Exception:
+    TORCH_OK = False  # 설치 안됨 시 MLP 비활성 안내
+
 # ---------------- 기본 설정 ----------------
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 CANVAS_W, CANVAS_H = 1280, 800
@@ -46,6 +56,12 @@ DEFAULT_EPSILON_PX   = 0.5   # 0이면 단순화 끔
 DEFAULT_CNT_BLUR_ENABLE = True
 DEFAULT_CNT_BLUR_METHOD = "Gaussian"   # 또는 "Median"
 DEFAULT_CNT_BLUR_KSIZE  = 3           # 홀수
+
+# MLP 기본 (Option에서 변경 가능)
+DEFAULT_MLP_LAYERS = 3
+DEFAULT_MLP_NEURONS_TEXT = "10,10,10"  # 레이어별 뉴런
+DEFAULT_MLP_USE_DROPOUT = True
+DEFAULT_MLP_DROPOUT_RATE = 0.05
 
 # --------------- 유틸 ---------------
 def imread_unicode(path: Path, flags=cv2.IMREAD_COLOR):
@@ -168,6 +184,25 @@ def contours_to_yoloseg(contours: List[np.ndarray], W: int, H: int, class_id: in
         lines.append(f"{class_id} " + " ".join(coords))
     return lines
 
+# ----- PyTorch MLP 정의 -----
+class MLPNet(nn.Module):
+    def __init__(self, input_dim: int, hidden_sizes: List[int], num_classes: int = 2,
+                 use_dropout: bool = True, dropout_rate: float = 0.05):
+        super().__init__()
+        layers = []
+        prev = input_dim
+        for h in hidden_sizes:
+            layers.append(nn.Linear(prev, int(h)))
+            layers.append(nn.ReLU(inplace=True))
+            if use_dropout and dropout_rate > 0:
+                layers.append(nn.Dropout(p=float(dropout_rate)))
+            prev = int(h)
+        layers.append(nn.Linear(prev, num_classes))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
 # --------------- 앱 ---------------
 class App:
     def __init__(self, master: tk.Tk):
@@ -196,8 +231,12 @@ class App:
         self.RGB_list: List[Tuple[int, int, int]] = []  # (R,G,B)
         self.Cls_list: List[str] = []                # "FG"/"BG"
 
-        # 모델
+        # 모델 (sklearn용)
         self.model: Optional[Pipeline] = None
+        # MLP (torch)용
+        self.torch_model: Optional[nn.Module] = None
+        self.torch_scaler: Optional[StandardScaler] = None
+
         self.is_trained: bool = False
         self.last_train_date: Optional[str] = None
         self.model_type_var = tk.StringVar(value="SVM - rbf")
@@ -214,6 +253,12 @@ class App:
         self.cnt_blur_enable = tk.BooleanVar(value=DEFAULT_CNT_BLUR_ENABLE)
         self.cnt_blur_method = tk.StringVar(value=DEFAULT_CNT_BLUR_METHOD)
         self.cnt_blur_ksize = tk.IntVar(value=DEFAULT_CNT_BLUR_KSIZE)
+
+        # MLP 옵션
+        self.mlp_layers_var = tk.IntVar(value=DEFAULT_MLP_LAYERS)
+        self.mlp_neurons_text = tk.StringVar(value=DEFAULT_MLP_NEURONS_TEXT)
+        self.mlp_use_dropout = tk.BooleanVar(value=DEFAULT_MLP_USE_DROPOUT)
+        self.mlp_dropout_rate = tk.DoubleVar(value=DEFAULT_MLP_DROPOUT_RATE)
 
         # 캔버스/렌더링(줌/팬)
         self.canvas = None
@@ -237,8 +282,9 @@ class App:
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         ttk.Label(top, text="Model:").pack(side=tk.LEFT)
+        models = ["SVM - linear", "SVM - rbf", "SVM - poly", "RF", "MLP (PyTorch)"]
         ttk.Combobox(top, textvariable=self.model_type_var, state="readonly",
-                     values=["SVM - linear", "SVM - rbf", "SVM - poly", "RF"], width=14).pack(side=tk.LEFT, padx=4)
+                     values=models, width=18).pack(side=tk.LEFT, padx=4)
         ttk.Label(top, text="Epochs:").pack(side=tk.LEFT, padx=(10, 0))
         ttk.Spinbox(top, from_=1, to=5000, textvariable=self.epochs_var, width=6).pack(side=tk.LEFT, padx=4)
 
@@ -525,7 +571,9 @@ class App:
                 pipe.fit(X[idxs], y[idxs])
                 pb["value"] = ep; lbl.config(text=f"{mname} | Epoch {ep} / {epochs}"); pop.update()
             self.model = pipe
-        else:
+            self.torch_model = None; self.torch_scaler = None
+
+        elif mname == "RF":
             scaler = StandardScaler()
             Xs = scaler.fit_transform(X)
             rf = RandomForestClassifier(n_estimators=0, warm_start=True, random_state=42, n_jobs=-1)
@@ -534,25 +582,93 @@ class App:
                 rf.fit(Xs, y)
                 pb["value"] = ep; lbl.config(text=f"RF | Trees {ep} / {epochs}"); pop.update()
             self.model = Pipeline([("scaler", scaler), ("clf", rf)])
+            self.torch_model = None; self.torch_scaler = None
+
+        else:  # MLP (PyTorch)
+            if not TORCH_OK:
+                pop.destroy()
+                messagebox.showerror("오류", "PyTorch가 설치되어 있지 않습니다. pip install torch 로 설치하세요.")
+                return
+            # 스케일링
+            scaler = StandardScaler().fit(X)
+            Xs = scaler.transform(X).astype(np.float32)
+            X_tensor = torch.from_numpy(Xs)
+            y_tensor = torch.from_numpy(y.astype(np.int64))
+
+            # 아키텍처
+            layers = max(1, int(self.mlp_layers_var.get()))
+            neurons = self._parse_neurons(self.mlp_neurons_text.get(), layers)
+            use_do = bool(self.mlp_use_dropout.get())
+            do_rate = max(0.0, min(0.9, float(self.mlp_dropout_rate.get())))
+            model = MLPNet(input_dim=11, hidden_sizes=neurons, num_classes=2,
+                           use_dropout=use_do, dropout_rate=do_rate)
+
+            # 옵티마이저/로스
+            optimizer = optim.Adam(model.parameters(), lr=1e-3)
+            criterion = nn.CrossEntropyLoss()
+
+            model.train()
+            B = min(256, max(16, len(y)//4))  # 간단 배치 크기
+            for ep in range(1, epochs+1):
+                # 셔플
+                idxs = np.random.permutation(len(y))
+                Xb = X_tensor[idxs]; yb = y_tensor[idxs]
+                # 미니배치
+                for i in range(0, len(y), B):
+                    xb = Xb[i:i+B]; ybt = yb[i:i+B]
+                    optimizer.zero_grad()
+                    logits = model(xb)
+                    loss = criterion(logits, ybt)
+                    loss.backward()
+                    optimizer.step()
+                pb["value"] = ep; lbl.config(text=f"MLP | Epoch {ep} / {epochs}"); pop.update()
+
+            self.torch_model = model.eval()
+            self.torch_scaler = scaler
+            self.model = None  # sklearn 파이프라인 비활성
 
         self.is_trained = True
         self.last_train_date = datetime.now().strftime("%Y%m%d")
         pop.destroy()
         messagebox.showinfo("완료", f"학습 완료: {mname}, epochs={epochs}, 샘플={len(y)}")
 
+    def _parse_neurons(self, text: str, layers: int) -> List[int]:
+        try:
+            parts = [int(max(1, int(p.strip()))) for p in text.split(",") if p.strip() != ""]
+        except Exception:
+            parts = []
+        if not parts:
+            parts = [10]*layers
+        if len(parts) < layers:
+            parts = parts + [parts[-1]]*(layers - len(parts))
+        elif len(parts) > layers:
+            parts = parts[:layers]
+        return parts
+
     # ---------- 분류 ----------
     def on_classify(self):
         if self.img_bgr is None:
             return
-        if not self.is_trained or self.model is None:
+        mname = self.model_type_var.get()
+        if not self.is_trained or (self.model is None and self.torch_model is None):
             messagebox.showwarning("경고", "먼저 Train 또는 Load Weights를 수행하세요.")
             return
+
         feats = extract_features_image(self.img_bgr)
         try:
-            pred = self.model.predict(feats).astype(np.uint8)
+            if mname == "MLP (PyTorch)" or (self.torch_model is not None and self.model is None):
+                # Torch 경로
+                Xs = self.torch_scaler.transform(feats).astype(np.float32)
+                with torch.no_grad():
+                    logits = self.torch_model(torch.from_numpy(Xs))
+                    pred = torch.argmax(logits, dim=1).cpu().numpy().astype(np.uint8)
+            else:
+                # sklearn 경로
+                pred = self.model.predict(feats).astype(np.uint8)
         except Exception as e:
             messagebox.showerror("오류", f"분류 실패: {e}")
             return
+
         H, W = self.img_bgr.shape[:2]
         mask = pred.reshape(H, W)  # 1=FG, 0=BG
 
@@ -608,42 +724,107 @@ class App:
 
     # ---------- 가중치 저장/로드 ----------
     def on_save_weights(self):
-        if not self.is_trained or self.model is None:
+        if not self.is_trained:
             messagebox.showwarning("경고", "학습된 모델이 없습니다.")
             return
-        model_name = self.model_type_var.get().replace(" ", "")  # "SVM-rbf" 등
+        mname = self.model_type_var.get()
         epochs = int(self.epochs_var.get())
         ymd = self.last_train_date or datetime.now().strftime("%Y%m%d")
-        default_name = f"{model_name}_{epochs}_{ymd}.joblib"
-        path = filedialog.asksaveasfilename(
-            title="모델 저장", defaultextension=".joblib", initialfile=default_name,
-            filetypes=[("Joblib", "*.joblib"), ("All files", "*.*")]
-        )
-        if not path: return
-        payload = {"model": self.model, "meta": {"model_type": self.model_type_var.get(),
-                                                 "epochs": epochs, "date": ymd}}
-        try: joblib.dump(payload, path)
-        except Exception as e:
-            messagebox.showerror("오류", f"저장 실패: {e}"); return
-        messagebox.showinfo("완료", f"저장됨: {Path(path).name}")
+
+        if mname == "MLP (PyTorch)" or (self.torch_model is not None and self.model is None):
+            default_name = f"MLP_{epochs}_{ymd}.pt"
+            path = filedialog.asksaveasfilename(
+                title="MLP 모델 저장", defaultextension=".pt", initialfile=default_name,
+                filetypes=[("PyTorch", "*.pt"), ("All files", "*.*")]
+            )
+            if not path: return
+            saveobj = {
+                "state_dict": self.torch_model.state_dict(),
+                "arch": {
+                    "input_dim": 11,
+                    "hidden_sizes": self._parse_neurons(self.mlp_neurons_text.get(), int(self.mlp_layers_var.get())),
+                    "num_classes": 2,
+                    "use_dropout": bool(self.mlp_use_dropout.get()),
+                    "dropout_rate": float(self.mlp_dropout_rate.get()),
+                },
+                "scaler": self.torch_scaler,
+                "meta": {"model_type": "MLP (PyTorch)", "epochs": epochs, "date": ymd}
+            }
+            try:
+                torch.save(saveobj, path)
+            except Exception as e:
+                messagebox.showerror("오류", f"저장 실패: {e}"); return
+            messagebox.showinfo("완료", f"저장됨: {Path(path).name}")
+        else:
+            model_name = mname.replace(" ", "")
+            default_name = f"{model_name}_{epochs}_{ymd}.joblib"
+            path = filedialog.asksaveasfilename(
+                title="모델 저장", defaultextension=".joblib", initialfile=default_name,
+                filetypes=[("Joblib", "*.joblib"), ("All files", "*.*")]
+            )
+            if not path: return
+            payload = {"model": self.model, "meta": {"model_type": mname, "epochs": epochs, "date": ymd}}
+            try: joblib.dump(payload, path)
+            except Exception as e:
+                messagebox.showerror("오류", f"저장 실패: {e}"); return
+            messagebox.showinfo("완료", f"저장됨: {Path(path).name}")
 
     def on_load_weights(self):
         path = filedialog.askopenfilename(
             title="모델 불러오기",
-            filetypes=[("Joblib", "*.joblib"), ("All files", "*.*")]
+            filetypes=[("Model files", "*.pt *.joblib"), ("PyTorch", "*.pt"), ("Joblib", "*.joblib"), ("All files", "*.*")]
         )
         if not path: return
-        try: payload = joblib.load(path)
-        except Exception as e:
-            messagebox.showerror("오류", f"불러오기 실패: {e}"); return
-        if not isinstance(payload, dict) or "model" not in payload:
-            messagebox.showerror("오류", "잘못된 모델 파일입니다."); return
-        self.model = payload["model"]; self.is_trained = True
-        meta = payload.get("meta", {})
-        self.model_type_var.set(meta.get("model_type", self.model_type_var.get()))
-        self.epochs_var.set(int(meta.get("epochs", self.epochs_var.get())))
-        self.last_train_date = meta.get("date", datetime.now().strftime("%Y%m%d"))
-        messagebox.showinfo("완료", f"모델 로드: {Path(path).name}")
+        path = Path(path)
+        if path.suffix.lower() == ".pt":
+            if not TORCH_OK:
+                messagebox.showerror("오류", "PyTorch가 설치되어 있지 않습니다. pip install torch 로 설치하세요.")
+                return
+            try:
+                payload = torch.load(path, map_location="cpu")
+            except Exception as e:
+                messagebox.showerror("오류", f"불러오기 실패: {e}"); return
+            arch = payload.get("arch", {})
+            model = MLPNet(
+                input_dim=int(arch.get("input_dim", 11)),
+                hidden_sizes=list(arch.get("hidden_sizes", [10,10,10])),
+                num_classes=int(arch.get("num_classes", 2)),
+                use_dropout=bool(arch.get("use_dropout", True)),
+                dropout_rate=float(arch.get("dropout_rate", 0.05)),
+            )
+            try:
+                model.load_state_dict(payload["state_dict"])
+            except Exception as e:
+                messagebox.showerror("오류", f"가중치 로드 실패: {e}"); return
+            self.torch_model = model.eval()
+            self.torch_scaler = payload.get("scaler", None)
+            self.model = None
+            self.is_trained = True
+            meta = payload.get("meta", {})
+            self.model_type_var.set(meta.get("model_type", "MLP (PyTorch)"))
+            self.epochs_var.set(int(meta.get("epochs", self.epochs_var.get())))
+            self.last_train_date = meta.get("date", datetime.now().strftime("%Y%m%d"))
+            # Option 창 표시값도 동기화
+            self.mlp_layers_var.set(len(arch.get("hidden_sizes", [10,10,10])))
+            self.mlp_neurons_text.set(",".join(str(int(n)) for n in arch.get("hidden_sizes", [10,10,10])))
+            self.mlp_use_dropout.set(bool(arch.get("use_dropout", True)))
+            self.mlp_dropout_rate.set(float(arch.get("dropout_rate", 0.05)))
+            messagebox.showinfo("완료", f"MLP 모델 로드: {path.name}")
+        else:
+            try:
+                payload = joblib.load(path)
+            except Exception as e:
+                messagebox.showerror("오류", f"불러오기 실패: {e}"); return
+            if not isinstance(payload, dict) or "model" not in payload:
+                messagebox.showerror("오류", "잘못된 모델 파일입니다."); return
+            self.model = payload["model"]
+            self.torch_model = None; self.torch_scaler = None
+            self.is_trained = True
+            meta = payload.get("meta", {})
+            self.model_type_var.set(meta.get("model_type", self.model_type_var.get()))
+            self.epochs_var.set(int(meta.get("epochs", self.epochs_var.get())))
+            self.last_train_date = meta.get("date", datetime.now().strftime("%Y%m%d"))
+            messagebox.showinfo("완료", f"모델 로드: {path.name}")
 
     # ---------- 데이터셋 Export/Load ----------
     def on_export_dataset(self):
@@ -690,9 +871,9 @@ class App:
         self._update_counts()
         messagebox.showinfo("완료", f"로딩된 항목: {loaded}")
 
-    # ---------- 옵션(모폴로지 + 컨투어 정교화) ----------
+    # ---------- 옵션(모폴로지 + 컨투어 정교화 + MLP) ----------
     def on_option(self):
-        win = tk.Toplevel(self.master); win.title("Options (Morphology & Contour)")
+        win = tk.Toplevel(self.master); win.title("Options (Morphology, Contour, MLP)")
         frm = ttk.Frame(win); frm.pack(padx=12, pady=12)
 
         # ---- Morphology
@@ -710,7 +891,7 @@ class App:
         ttk.Spinbox(frm, from_=0, to=10, textvariable=cl_var, width=6).grid(row=3, column=1, padx=4, pady=4)
 
         # ---- Contour Refinement
-        sep = ttk.Separator(frm, orient=tk.HORIZONTAL); sep.grid(row=4, column=0, columnspan=2, sticky="ew", pady=8)
+        ttk.Separator(frm, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=2, sticky="ew", pady=8)
         ttk.Label(frm, text="Contour Refinement").grid(row=5, column=0, sticky="w", padx=4, pady=(0,4), columnspan=2)
 
         ttk.Label(frm, text="Chain Approx:").grid(row=6, column=0, sticky="e", padx=4, pady=4)
@@ -736,6 +917,26 @@ class App:
         blur_ksize_var = tk.IntVar(value=int(self.cnt_blur_ksize.get()))
         ttk.Spinbox(frm, from_=3, to=31, increment=2, textvariable=blur_ksize_var, width=6).grid(row=10, column=1, padx=4, pady=4)
 
+        # ---- MLP (PyTorch)
+        ttk.Separator(frm, orient=tk.HORIZONTAL).grid(row=11, column=0, columnspan=2, sticky="ew", pady=8)
+        ttk.Label(frm, text="MLP (PyTorch)").grid(row=12, column=0, sticky="w", padx=4, pady=(0,4), columnspan=2)
+
+        ttk.Label(frm, text="# Hidden Layers:").grid(row=13, column=0, sticky="e", padx=4, pady=4)
+        layers_var = tk.IntVar(value=int(self.mlp_layers_var.get()))
+        ttk.Spinbox(frm, from_=1, to=10, textvariable=layers_var, width=6).grid(row=13, column=1, padx=4, pady=4)
+
+        ttk.Label(frm, text="Neurons per layer (comma):").grid(row=14, column=0, sticky="e", padx=4, pady=4)
+        neurons_var = tk.StringVar(value=self.mlp_neurons_text.get())
+        ttk.Entry(frm, textvariable=neurons_var, width=24).grid(row=14, column=1, padx=4, pady=4)
+
+        ttk.Label(frm, text="Use Dropout:").grid(row=15, column=0, sticky="e", padx=4, pady=4)
+        use_do_var = tk.BooleanVar(value=bool(self.mlp_use_dropout.get()))
+        ttk.Checkbutton(frm, variable=use_do_var).grid(row=15, column=1, sticky="w", padx=4, pady=4)
+
+        ttk.Label(frm, text="Dropout rate (0~0.9):").grid(row=16, column=0, sticky="e", padx=4, pady=4)
+        do_rate_var = tk.DoubleVar(value=float(self.mlp_dropout_rate.get()))
+        ttk.Spinbox(frm, from_=0.0, to=0.9, increment=0.01, textvariable=do_rate_var, width=6).grid(row=16, column=1, padx=4, pady=4)
+
         def apply_and_close():
             # Morph
             ks = int(ks_var.get())
@@ -746,16 +947,23 @@ class App:
 
             # Contour
             self.chain_approx_mode.set(ca_var.get())
-            self.poly_epsilon_px.set(float(eps_var.get()))
+            eps = float(eps_var.get())
+            self.poly_epsilon_px.set(max(0.0, min(10.0, eps)))
             self.cnt_blur_enable.set(bool(blur_enable_var.get()))
             self.cnt_blur_method.set(blur_method_var.get())
             k2 = int(blur_ksize_var.get())
             if k2 % 2 == 0: k2 += 1
             self.cnt_blur_ksize.set(max(3, k2))
 
+            # MLP
+            self.mlp_layers_var.set(max(1, int(layers_var.get())))
+            self.mlp_neurons_text.set(neurons_var.get())
+            self.mlp_use_dropout.set(bool(use_do_var.get()))
+            self.mlp_dropout_rate.set(max(0.0, min(0.9, float(do_rate_var.get()))))
+
             win.destroy()
 
-        btns = ttk.Frame(frm); btns.grid(row=11, column=0, columnspan=2, pady=(8,0))
+        btns = ttk.Frame(frm); btns.grid(row=17, column=0, columnspan=2, pady=(8,0))
         ttk.Button(btns, text="OK", command=apply_and_close).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=4)
 
@@ -764,7 +972,9 @@ class App:
         if messagebox.askyesno("확인", "누적 학습 데이터셋(X,y)을 모두 초기화할까요?"):
             self.X_list.clear(); self.y_list.clear()
             self.RGB_list.clear(); self.Cls_list.clear()
-            self.is_trained = False; self.model = None
+            self.is_trained = False
+            self.model = None
+            self.torch_model = None; self.torch_scaler = None
             self.last_mask = None; self.last_contours = []
             self.curr_fg.clear(); self.curr_bg.clear()
             self._update_counts(); self._redraw()
