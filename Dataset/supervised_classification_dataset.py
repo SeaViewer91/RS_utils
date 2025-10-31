@@ -2,16 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 FG/BG 인터랙티브 샘플링 → 감독분류(SVM/RF/MLP) → 모폴로지 후처리 → 정교한 외곽 폴리곤 → YOLO-seg Export
-- 시작 시 폴더 선택 팝업 + Load Images 버튼
-- 모델: SVM(linear/rbf/poly), RF, MLP(PyTorch) / Epochs 기본 100 (조절 가능), 진행 팝업 표시
-- Classify 결과 오버레이 투명도(10~100%), Clear 버튼
-- Export Dataset(CSV: IDX,R,G,B,Cls) / Dataset Load(CSV 불러와 이어서 학습)
-- 줌/팬: Ctrl+휠(줌), Ctrl+클릭(해당 지점을 화면 중앙으로 팬)
-- 모폴로지 기본: 커널 3x3, 열림1, 닫힘1 (Option에서 변경)
-- 컨투어 정교화: CHAIN_APPROX_NONE 기본, epsilon(px)로 단순화 강도 제어(0=끄기),
-  컨투어 추출 전 선택적 블러(가우시안/미디언) + 재이진화 옵션 (Option에서 설정)
-- YOLO-seg 저장 + 화면에는 붉은색(1px) 경계선 표시
-- MLP: 레이어 수/뉴런 개수/드롭아웃 사용 & rate를 Option에서 제어, *.pt로 저장/로드(구조 포함)
++ (2025-10-31) 업데이트
+  1) Dataset Split 버튼 추가
+     - 누적된 샘플을 Train:Valid:Test = 80:10:10 으로 자동 구분
+     - 버튼을 누르지 않으면 "들어온 순서" 기준으로 80/10/10 배치
+     - Export Dataset 시 Set 컬럼(TRAIN/VALID/TEST) 추가
+  2) Model Evaluation 버튼 추가
+     - Test 세트를 기준으로 Confusion Matrix, Accuracy, Precision, Recall, F1-score 팝업에 표시
 """
 
 import csv
@@ -231,6 +228,10 @@ class App:
         self.RGB_list: List[Tuple[int, int, int]] = []  # (R,G,B)
         self.Cls_list: List[str] = []                # "FG"/"BG"
 
+        # (신규) 각 샘플이 어떤 용도인지: "TRAIN"/"VALID"/"TEST"
+        self.data_roles: List[str] = []  # X_list와 동일 길이
+        self.random_split: bool = False  # Dataset Split 버튼을 누르면 True로 바뀜
+
         # 모델 (sklearn용)
         self.model: Optional[Pipeline] = None
         # MLP (torch)용
@@ -299,6 +300,11 @@ class App:
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(top, text="Export Dataset", command=self.on_export_dataset).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="Dataset Load", command=self.on_dataset_load).pack(side=tk.LEFT, padx=2)
+
+        # (신규) Dataset Split, Model Evaluation 버튼
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(top, text="Dataset Split", command=self.on_dataset_split).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Model Evaluation", command=self.on_model_evaluation).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(top, text="Option", command=self.on_option).pack(side=tk.LEFT, padx=2)
@@ -470,6 +476,8 @@ class App:
         b, g, r = self.img_bgr[yi, xi].tolist()
         self.RGB_list.append((int(r), int(g), int(b)))
         self.Cls_list.append(cls_str)
+        # (신규) 역할을 같이 넣어준다
+        self.data_roles.append(self._assign_role_for_index(len(self.X_list)-1))
         self._update_counts(); self._redraw()
 
     def on_right_click(self, e):
@@ -481,6 +489,8 @@ class App:
         self.X_list.append(feat[0].copy()); self.y_list.append(0)
         b, g, r = self.img_bgr[yi, xi].tolist()
         self.RGB_list.append((int(r), int(g), int(b))); self.Cls_list.append("BG")
+        # (신규)
+        self.data_roles.append(self._assign_role_for_index(len(self.X_list)-1))
         self._update_counts(); self._redraw()
 
     def on_wheel_zoom(self, e):
@@ -524,6 +534,7 @@ class App:
             if self.Cls_list[i] == cls_str:
                 self.Cls_list.pop(i); self.RGB_list.pop(i)
                 self.y_list.pop(i); self.X_list.pop(i)
+                self.data_roles.pop(i)   # (신규) 역할도 같이 제거
                 break
 
     def on_clear_current_points(self):
@@ -543,13 +554,72 @@ class App:
     def _update_counts(self):
         self.lbl_counts.config(text=f"FG_curr:{len(self.curr_fg)} BG_curr:{len(self.curr_bg)} | X_total:{len(self.X_list)}")
 
+    # ---------- Dataset Split ----------
+    def _assign_role_for_index(self, idx: int) -> str:
+        """
+        새 샘플이 추가될 때 어떤 용도로 쓸지 정해주는 함수.
+        - random_split == False → 들어온 순서대로 80:10:10
+        - random_split == True  → 나중에 on_dataset_split()으로 전체를 다시 섞을 거라 일단 TRAIN으로 넣어둔다
+        """
+        if self.random_split:
+            return "TRAIN"
+        # 순서 기준 배정
+        n = idx + 1  # 총 개수
+        # 0~0.8 → TRAIN, 0.8~0.9 → VALID, 0.9~1.0 → TEST
+        # 비율보다는 idx로 바로 계산
+        train_cut = int(0.8 * n)
+        valid_cut = int(0.9 * n)
+        # 위처럼 하면 추가될 때마다 경계가 살짝씩 바뀌므로 더 단순하게:
+        # idx 기준으로 판단
+        ratio = (idx) / max(1, n)
+        if ratio < 0.8:
+            return "TRAIN"
+        elif ratio < 0.9:
+            return "VALID"
+        else:
+            return "TEST"
+
+    def on_dataset_split(self):
+        """
+        Dataset Split 버튼을 눌렀을 때:
+        - 전체 샘플을 섞어서 80/10/10으로 다시 나눈다
+        """
+        n = len(self.X_list)
+        if n == 0:
+            messagebox.showwarning("알림", "분할할 데이터가 없습니다.")
+            return
+
+        idxs = np.arange(n)
+        np.random.shuffle(idxs)
+        n_train = int(n * 0.8)
+        n_valid = int(n * 0.1)
+        train_idx = idxs[:n_train]
+        valid_idx = idxs[n_train:n_train+n_valid]
+        test_idx = idxs[n_train+n_valid:]
+
+        roles = [""] * n
+        for i in train_idx: roles[i] = "TRAIN"
+        for i in valid_idx: roles[i] = "VALID"
+        for i in test_idx: roles[i] = "TEST"
+        self.data_roles = roles
+        self.random_split = True
+        messagebox.showinfo("완료", f"Dataset이 무작위로 분할되었습니다.\nTrain: {len(train_idx)} / Valid: {len(valid_idx)} / Test: {len(test_idx)}")
+
     # ---------- 학습 ----------
     def on_train(self):
         if len(self.X_list) < 10 or len(set(self.y_list)) < 2:
             messagebox.showwarning("경고", "학습을 위해 FG/BG 포인트를 더 추가하세요(최소 10개, 두 클래스 모두).")
             return
-        X = np.array(self.X_list, dtype=np.float32)
-        y = np.array(self.y_list, dtype=np.int32)
+
+        # (신규) Train 세트만 가져온다
+        X_train, y_train = self._get_subset("TRAIN")
+        X_valid, y_valid = self._get_subset("VALID")  # 지금은 안 쓰지만 나중에 쓸 수 있게
+        if len(X_train) < 5 or len(set(y_train)) < 2:
+            messagebox.showwarning("경고", f"Train 세트가 부족합니다. (현재 Train={len(X_train)})")
+            return
+
+        X = np.array(X_train, dtype=np.float32)
+        y = np.array(y_train, dtype=np.int32)
         epochs = max(1, int(self.epochs_var.get()))
         mname = self.model_type_var.get()
 
@@ -630,7 +700,7 @@ class App:
         self.is_trained = True
         self.last_train_date = datetime.now().strftime("%Y%m%d")
         pop.destroy()
-        messagebox.showinfo("완료", f"학습 완료: {mname}, epochs={epochs}, 샘플={len(y)}")
+        messagebox.showinfo("완료", f"학습 완료: {mname}, epochs={epochs}, Train 샘플={len(y)}")
 
     def _parse_neurons(self, text: str, layers: int) -> List[int]:
         try:
@@ -644,6 +714,16 @@ class App:
         elif len(parts) > layers:
             parts = parts[:layers]
         return parts
+
+    def _get_subset(self, role: str):
+        """role: 'TRAIN'|'VALID'|'TEST'"""
+        Xs = []
+        ys = []
+        for x, y, r in zip(self.X_list, self.y_list, self.data_roles):
+            if r == role:
+                Xs.append(x)
+                ys.append(y)
+        return Xs, ys
 
     # ---------- 분류 ----------
     def on_classify(self):
@@ -839,9 +919,10 @@ class App:
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(["IDX", "R", "G", "B", "Cls"])
-                for i, ((r, g, b), cls) in enumerate(zip(self.RGB_list, self.Cls_list), start=1):
-                    w.writerow([i, r, g, b, cls])
+                # (신규) Set 컬럼 추가
+                w.writerow(["IDX", "R", "G", "B", "Cls", "Set"])
+                for i, ((r, g, b), cls, role) in enumerate(zip(self.RGB_list, self.Cls_list, self.data_roles), start=1):
+                    w.writerow([i, r, g, b, cls, role])
         except Exception as e:
             messagebox.showerror("오류", f"CSV 저장 실패: {e}"); return
         messagebox.showinfo("완료", f"데이터셋 저장: {Path(path).name}")
@@ -865,6 +946,11 @@ class App:
                                     dtype=np.float32)
                     self.X_list.append(feat[0]); self.y_list.append(ylab)
                     self.RGB_list.append((r, g, b)); self.Cls_list.append("FG" if ylab==1 else "BG")
+                    # CSV에 Set이 있으면 그걸 쓰고, 없으면 순서대로 배정
+                    role = row.get("Set", "").strip().upper()
+                    if role not in ("TRAIN", "VALID", "TEST"):
+                        role = self._assign_role_for_index(len(self.X_list)-1)
+                    self.data_roles.append(role)
                     loaded += 1
         except Exception as e:
             messagebox.showerror("오류", f"CSV 로드 실패: {e}"); return
@@ -972,6 +1058,8 @@ class App:
         if messagebox.askyesno("확인", "누적 학습 데이터셋(X,y)을 모두 초기화할까요?"):
             self.X_list.clear(); self.y_list.clear()
             self.RGB_list.clear(); self.Cls_list.clear()
+            self.data_roles.clear()     # (신규)
+            self.random_split = False   # (신규)
             self.is_trained = False
             self.model = None
             self.torch_model = None; self.torch_scaler = None
@@ -979,6 +1067,68 @@ class App:
             self.curr_fg.clear(); self.curr_bg.clear()
             self._update_counts(); self._redraw()
             messagebox.showinfo("완료", "누적 데이터셋이 초기화되었습니다. 새로 샘플링하세요.")
+
+    # ---------- 모델 평가 ----------
+    def on_model_evaluation(self):
+        if not self.is_trained:
+            messagebox.showwarning("경고", "먼저 모델을 학습시키거나 불러오세요.")
+            return
+
+        X_test, y_test = self._get_subset("TEST")
+        if len(X_test) == 0:
+            messagebox.showwarning("경고", "Test 세트가 없습니다. Dataset Split을 하거나 일부 샘플을 Test로 지정하세요.")
+            return
+
+        # 예측
+        mname = self.model_type_var.get()
+        try:
+            if mname == "MLP (PyTorch)" or (self.torch_model is not None and self.model is None):
+                Xs = self.torch_scaler.transform(np.array(X_test, dtype=np.float32)).astype(np.float32)
+                with torch.no_grad():
+                    logits = self.torch_model(torch.from_numpy(Xs))
+                    y_pred = torch.argmax(logits, dim=1).cpu().numpy().astype(np.int32)
+            else:
+                y_pred = self.model.predict(np.array(X_test, dtype=np.float32)).astype(np.int32)
+        except Exception as e:
+            messagebox.showerror("오류", f"평가 실패: {e}")
+            return
+
+        y_true = np.array(y_test, dtype=np.int32)
+
+        # 지표 계산 (이진 FG(1) / BG(0))
+        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+        tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+
+        total = len(y_true)
+        acc = (tp + tn) / total if total else 0.0
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        if (prec + rec) > 0:
+            f1 = 2 * prec * rec / (prec + rec)
+        else:
+            f1 = 0.0
+
+        # 팝업으로 표시
+        win = tk.Toplevel(self.master); win.title("Model Evaluation (Test set)")
+        frm = ttk.Frame(win); frm.pack(padx=12, pady=12)
+
+        ttk.Label(frm, text="Confusion Matrix (rows=true, cols=pred)").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0,6))
+        # 표처럼 간단히
+        ttk.Label(frm, text="          Pred 0    Pred 1").grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, text=f"True 0 :   {tn:4d}      {fp:4d}").grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, text=f"True 1 :   {fn:4d}      {tp:4d}").grid(row=3, column=0, columnspan=2, sticky="w")
+
+        ttk.Separator(frm, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=2, sticky="ew", pady=8)
+
+        ttk.Label(frm, text=f"Total samples (Test): {total}").grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(frm, text=f"Accuracy : {acc:.4f}").grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(frm, text=f"Precision: {prec:.4f}").grid(row=7, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(frm, text=f"Recall   : {rec:.4f}").grid(row=8, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(frm, text=f"F1-score : {f1:.4f}").grid(row=9, column=0, columnspan=2, sticky="w", pady=2)
+
+        ttk.Button(frm, text="Close", command=win.destroy).grid(row=10, column=0, columnspan=2, pady=(10,0))
 
 # --------------- main ---------------
 def main():
