@@ -11,6 +11,9 @@ FG/BG 인터랙티브 샘플링 → 감독분류(SVM/RF/MLP) → 모폴로지 �
   5) Option에 BBox Subsampling(0~1) / All Pixels 선택 추가 (기본 0.3)
   6) 그린 BBox를 프리뷰에 유지 (FG=시안, BG=마젠타)
   7) "Clear BBoxes (this image)" 버튼으로 현재 이미지의 BBox 프리뷰 초기화
++ (2025-11-26-2) 패치
+  8) Classify 이후 BBox 테두리가 안 보이던 버그 수정
+     - _redraw()의 그리기 순서를 '오버레이 먼저, BBox 나중'으로 변경
 """
 
 import csv
@@ -477,25 +480,11 @@ class App:
         cy = int(self.center_xy[1] * H * disp_scale)
         top_left_x = int(-cx + CANVAS_W // 2)
         top_left_y = int(-cy + CANVAS_H // 2)
+
+        # 1) 원본 이미지
         self.canvas.create_image(top_left_x, top_left_y, image=self.tk_img, anchor=tk.NW)
 
-        # ----- 과거 BBox 프리뷰(테두리) -----
-        for (x1, y1, x2, y2, cls_str) in self.bbox_history:
-            x1c, y1c = self._image_to_canvas(x1, y1)
-            x2c, y2c = self._image_to_canvas(x2, y2)
-            color = "#00FFFF" if cls_str == "FG" else "#FF00FF"
-            self.canvas.create_rectangle(x1c, y1c, x2c, y2c, outline=color, width=2)
-
-        # ----- 드래그 중인 임시 BBox -----
-        if self.bbox_dragging:
-            x1, y1 = self.bbox_start
-            x2, y2 = self.bbox_end
-            x1c, y1c = self._image_to_canvas(x1, y1)
-            x2c, y2c = self._image_to_canvas(x2, y2)
-            color = "#00FFFF" if self.current_label.get() == "FG" else "#FF00FF"
-            self.canvas.create_rectangle(x1c, y1c, x2c, y2c, outline=color, width=2, dash=(4,2))
-
-        # ----- 분류 오버레이 -----
+        # 2) 오버레이(분류 결과) - 먼저 올림
         if self.last_mask is not None:
             transp = float(self.overlay_transp.get())
             alpha = 1.0 - max(10.0, min(100.0, transp)) / 100.0
@@ -504,7 +493,23 @@ class App:
             self.tk_overlay = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)))
             self.canvas.create_image(top_left_x, top_left_y, image=self.tk_overlay, anchor=tk.NW)
 
-        # 포인트 시각화
+        # 3) 과거 BBox 프리뷰(항상 오버레이 위에 보이도록 여기서 그림)
+        for (x1, y1, x2, y2, cls_str) in self.bbox_history:
+            x1c, y1c = self._image_to_canvas(x1, y1)
+            x2c, y2c = self._image_to_canvas(x2, y2)
+            color = "#00FFFF" if cls_str == "FG" else "#FF00FF"
+            self.canvas.create_rectangle(x1c, y1c, x2c, y2c, outline=color, width=2)
+
+        # 4) 드래그 중인 임시 BBox(오버레이+과거BBox 위에)
+        if self.bbox_dragging:
+            x1, y1 = self.bbox_start
+            x2, y2 = self.bbox_end
+            x1c, y1c = self._image_to_canvas(x1, y1)
+            x2c, y2c = self._image_to_canvas(x2, y2)
+            color = "#00FFFF" if self.current_label.get() == "FG" else "#FF00FF"
+            self.canvas.create_rectangle(x1c, y1c, x2c, y2c, outline=color, width=2, dash=(4,2))
+
+        # 5) 포인트 시각화(최상단)
         for (x, y) in self.curr_fg:
             self._draw_dot(x, y, "#00FF00")
         for (x, y) in self.curr_bg:
