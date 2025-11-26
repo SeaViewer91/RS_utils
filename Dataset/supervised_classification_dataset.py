@@ -2,18 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 FG/BG 인터랙티브 샘플링 → 감독분류(SVM/RF/MLP) → 모폴로지 후처리 → 정교한 외곽 폴리곤 → YOLO-seg Export
-+ (2025-10-31) 업데이트
-  1) Dataset Split 버튼 추가
-  2) Model Evaluation 버튼 추가
-  3) Image List 버튼 추가
-+ (2025-11-26) 업데이트
-  4) BBox 샘플링 모드 추가 (드래그로 박스 그려 내부 픽셀 일괄 추가)
-  5) Option에 BBox Subsampling(0~1) / All Pixels 선택 추가 (기본 0.3)
-  6) 그린 BBox를 프리뷰에 유지 (FG=시안, BG=마젠타)
-  7) "Clear BBoxes (this image)" 버튼으로 현재 이미지의 BBox 프리뷰 초기화
-+ (2025-11-26-2) 패치
-  8) Classify 이후 BBox 테두리가 안 보이던 버그 수정
-     - _redraw()의 그리기 순서를 '오버레이 먼저, BBox 나중'으로 변경
+(2025-10-31 업데이트 + BBox 기능/9D 특징/옵션 확장 반영 버전)
+
+- 포인트 샘플링 + BBox 샘플링(전체/서브샘플)
+- 9차원 특징(BGR+HSV+Lab) 사용 (정규화 좌표 미사용)
+- BBox 프리뷰 유지, Clear Bboxes 지원
+- Classify 이후에도 BBox 표시
 """
 
 import csv
@@ -53,21 +47,21 @@ DEFAULT_OPEN_ITER   = 1
 DEFAULT_CLOSE_ITER  = 1
 
 # 컨투어(정교화) 기본값 (Option에서 변경 가능)
-DEFAULT_CHAIN_APPROX = "High precision (CHAIN_APPROX_NONE)"
-DEFAULT_EPSILON_PX   = 0.5
+DEFAULT_CHAIN_APPROX = "High precision (CHAIN_APPROX_NONE)"   # 또는 "Simple (CHAIN_APPROX_SIMPLE)"
+DEFAULT_EPSILON_PX   = 0.5   # 0이면 단순화 끔
 DEFAULT_CNT_BLUR_ENABLE = True
 DEFAULT_CNT_BLUR_METHOD = "Gaussian"   # 또는 "Median"
-DEFAULT_CNT_BLUR_KSIZE  = 3            # 홀수
+DEFAULT_CNT_BLUR_KSIZE  = 3           # 홀수
 
 # MLP 기본 (Option에서 변경 가능)
 DEFAULT_MLP_LAYERS = 3
-DEFAULT_MLP_NEURONS_TEXT = "10,10,10"
+DEFAULT_MLP_NEURONS_TEXT = "10,10,10"  # 레이어별 뉴런
 DEFAULT_MLP_USE_DROPOUT = True
 DEFAULT_MLP_DROPOUT_RATE = 0.05
 
-# BBox 기본 (Option에서 변경 가능)
-DEFAULT_BBOX_SUBSAMPLE_ENABLE = True
-DEFAULT_BBOX_SUBSAMPLE_RATIO = 0.3  # 0~1
+# BBox 샘플링 옵션 기본
+DEFAULT_BBOX_USE_ALL = True
+DEFAULT_BBOX_RATIO = 0.3
 
 # --------------- 유틸 ---------------
 def imread_unicode(path: Path, flags=cv2.IMREAD_COLOR):
@@ -88,30 +82,26 @@ def imwrite_unicode(path: Path, image: np.ndarray) -> bool:
 def bgr_to_pil(bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
+# ---- 9D 특징: BGR+HSV+Lab ----
 def extract_features_image(image_bgr: np.ndarray) -> np.ndarray:
-    """전체 픽셀 특징: BGR + HSV + Lab + 정규화 좌표(x,y) => (H*W, 11)"""
-    H, W = image_bgr.shape[:2]
+    """전체 픽셀 특징: BGR + HSV + Lab => (H*W, 9)"""
     bgr = image_bgr.reshape(-1, 3).astype(np.float32)
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2Lab).reshape(-1, 3).astype(np.float32)
-    yy, xx = np.mgrid[0:H, 0:W]
-    xn = (xx.astype(np.float32) / max(1, W-1)).reshape(-1, 1)
-    yn = (yy.astype(np.float32) / max(1, H-1)).reshape(-1, 1)
-    return np.concatenate([bgr, hsv, lab, xn, yn], axis=1)
+    return np.concatenate([bgr, hsv, lab], axis=1)
 
 def feature_at_xy(image_bgr: np.ndarray, x: int, y: int) -> np.ndarray:
-    """한 픽셀 특징 (1, 11)"""
+    """한 픽셀 특징 (1, 9)"""
     H, W = image_bgr.shape[:2]
     if x < 0 or x >= W or y < 0 or y >= H:
-        return np.zeros((1, 11), np.float32)
-    b, g, r = image_bgr[y, x].astype(np.float32)
+        return np.zeros((1, 9), np.float32)
+    # 한 픽셀 접근 시 전체 변환은 과하지만 간단성을 위해 그대로 사용
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2Lab)
+    b, g, r = image_bgr[y, x].astype(np.float32)
     hh, ss, vv = hsv[y, x].astype(np.float32)
     ll, aa, bb = lab[y, x].astype(np.float32)
-    xn = float(x) / max(1, W-1)
-    yn = float(y) / max(1, H-1)
-    return np.array([[b, g, r, hh, ss, vv, ll, aa, bb, xn, yn]], dtype=np.float32)
+    return np.array([[b, g, r, hh, ss, vv, ll, aa, bb]], dtype=np.float32)
 
 def hsv_lab_from_rgb(r: int, g: int, b: int):
     """CSV 로드 시 RGB만 있을 때 HSV/Lab를 복원"""
@@ -139,19 +129,29 @@ def find_outer_contours(mask01: np.ndarray,
                         blur_method: str = DEFAULT_CNT_BLUR_METHOD,
                         blur_ksize: int = DEFAULT_CNT_BLUR_KSIZE) -> List[np.ndarray]:
     """
-    정교한 외곽 컨투어 추출
+    정교한 외곽 컨투어 추출:
+      - 체인 압축: CHAIN_APPROX_NONE(정밀) / CHAIN_APPROX_SIMPLE
+      - epsilon_px(픽셀)로 다각형 단순화 강도 제어(0이면 단순화 해제)
+      - 컨투어 전처리: 선택적 블러 + 재이진화(경계 매끄럽게)
     """
     u8 = (mask01 > 0).astype(np.uint8) * 255
+
+    # 선택적 블러 + 재이진화
     if blur_enable:
         k = max(3, int(blur_ksize))
         if k % 2 == 0: k += 1
         if blur_method.lower().startswith("median"):
             u8 = cv2.medianBlur(u8, k)
-        else:
+        else:  # Gaussian
             u8 = cv2.GaussianBlur(u8, (k, k), 0)
         _, u8 = cv2.threshold(u8, 127, 255, cv2.THRESH_BINARY)
 
-    chain_flag = cv2.CHAIN_APPROX_NONE if chain_approx_mode.startswith("High") else cv2.CHAIN_APPROX_SIMPLE
+    # 체인 모드
+    if chain_approx_mode.startswith("High"):
+        chain_flag = cv2.CHAIN_APPROX_NONE
+    else:
+        chain_flag = cv2.CHAIN_APPROX_SIMPLE
+
     contours, _ = cv2.findContours(u8, cv2.RETR_EXTERNAL, chain_flag)
 
     outs = []
@@ -161,7 +161,7 @@ def find_outer_contours(mask01: np.ndarray,
         if epsilon_px and epsilon_px > 0:
             approx = cv2.approxPolyDP(c, float(epsilon_px), True)
         else:
-            approx = c
+            approx = c  # 단순화 끔(가장 정교)
         if len(approx) >= 3:
             outs.append(approx)
     return outs
@@ -203,7 +203,7 @@ class MLPNet(nn.Module):
 class App:
     def __init__(self, master: tk.Tk):
         self.master = master
-        master.title("FG/BG Interactive Seg → YOLO-seg")
+        master.title("FG/BG Interactive Seg → YOLO-seg (9D + BBox)")
 
         # 경로/이미지 상태
         self.image_dir: Optional[Path] = None
@@ -213,7 +213,7 @@ class App:
         self.img_bgr: Optional[np.ndarray] = None
 
         # 분류/표시 상태
-        self.last_mask: Optional[np.ndarray] = None
+        self.last_mask: Optional[np.ndarray] = None   # 모폴로지 후 최종 마스크(0/1)
         self.last_contours: List[np.ndarray] = []
         self.overlay_transp = tk.DoubleVar(value=10.0)  # 10~100 (%)
 
@@ -222,19 +222,21 @@ class App:
         self.curr_bg: List[Tuple[int, int]] = []
         self.current_label = tk.StringVar(value="FG")
 
-        self.X_list: List[np.ndarray] = []
-        self.y_list: List[int] = []
-        self.RGB_list: List[Tuple[int, int, int]] = []
-        self.Cls_list: List[str] = []
+        self.X_list: List[np.ndarray] = []           # (9,) 특징
+        self.y_list: List[int] = []                  # 1(FG), 0(BG)
+        self.RGB_list: List[Tuple[int, int, int]] = []  # (R,G,B)
+        self.Cls_list: List[str] = []                # "FG"/"BG"
 
-        # Train/Valid/Test 역할 관리
-        self.data_roles: List[str] = []
-        self.random_split: bool = False
+        # (신규) 각 샘플이 어떤 용도인지: "TRAIN"/"VALID"/"TEST"
+        self.data_roles: List[str] = []  # X_list와 동일 길이
+        self.random_split: bool = False  # Dataset Split 버튼을 누르면 True로 바뀜
 
-        # 모델 (sklearn/torch)
+        # 모델 (sklearn용)
         self.model: Optional[Pipeline] = None
+        # MLP (torch)용
         self.torch_model: Optional[nn.Module] = None
         self.torch_scaler: Optional[StandardScaler] = None
+
         self.is_trained: bool = False
         self.last_train_date: Optional[str] = None
         self.model_type_var = tk.StringVar(value="SVM - rbf")
@@ -245,7 +247,7 @@ class App:
         self.morph_open_iter = DEFAULT_OPEN_ITER
         self.morph_close_iter = DEFAULT_CLOSE_ITER
 
-        # 컨투어 옵션
+        # 컨투어 옵션(정교화)
         self.chain_approx_mode = tk.StringVar(value=DEFAULT_CHAIN_APPROX)
         self.poly_epsilon_px = tk.DoubleVar(value=DEFAULT_EPSILON_PX)
         self.cnt_blur_enable = tk.BooleanVar(value=DEFAULT_CNT_BLUR_ENABLE)
@@ -264,22 +266,22 @@ class App:
         self.tk_overlay = None
         self.base_scale = 1.0
         self.zoom = 1.0
-        self.center_xy = (0.5, 0.5)
+        self.center_xy = (0.5, 0.5)  # 이미지 내 정규화 중심
 
-        # ------ BBox 상태 ------
-        self.bbox_mode = tk.BooleanVar(value=False)     # BBox 모드 토글
-        self.bbox_dragging = False
-        self.bbox_start = (0, 0)                        # 이미지 좌표
-        self.bbox_end = (0, 0)                          # 이미지 좌표
-        self.bbox_history: List[Tuple[int, int, int, int, str]] = []  # (x1,y1,x2,y2, "FG"/"BG")
-        self.bbox_subsample_enable = tk.BooleanVar(value=DEFAULT_BBOX_SUBSAMPLE_ENABLE)
-        self.bbox_subsample_ratio = tk.DoubleVar(value=DEFAULT_BBOX_SUBSAMPLE_RATIO)
+        # ----- BBox 상태 및 옵션 -----
+        self.bbox_mode = tk.BooleanVar(value=False)   # BBox 드로잉 모드 토글
+        self.bbox_start_xy = None                    # (x0, y0)
+        self.bbox_curr_xy = None                     # (x1, y1) 드래그 중 커서
+        self.bboxes_per_image = {}                   # { image_name: [(x1,y1,x2,y2), ...] }
+        self.bbox_use_all_pixels = tk.BooleanVar(value=DEFAULT_BBOX_USE_ALL)
+        self.bbox_subsample_ratio = tk.DoubleVar(value=DEFAULT_BBOX_RATIO)
 
         self._build_ui()
         self._ask_and_load_dir(initial=True)
 
     # ---------- UI ----------
     def _build_ui(self):
+        # ------ 1행: 상단 툴바 ------
         top = ttk.Frame(self.master); top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
         ttk.Button(top, text="Load Images", command=self._ask_and_load_dir).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="Prev", command=self.on_prev).pack(side=tk.LEFT, padx=2)
@@ -315,38 +317,44 @@ class App:
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(top, text="Option", command=self.on_option).pack(side=tk.LEFT, padx=2)
 
+        # ------ 경로/카운트 표시줄 ------
         mid = ttk.Frame(self.master); mid.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
         self.lbl_info = ttk.Label(mid, text="Path: -"); self.lbl_info.pack(side=tk.LEFT, padx=4)
         self.lbl_counts = ttk.Label(mid, text="FG_curr:0 BG_curr:0 | X_total:0"); self.lbl_counts.pack(side=tk.RIGHT, padx=4)
 
+        # ------ 2행: 라벨/포인트 & BBox 버튼 ------
         lab = ttk.Frame(self.master); lab.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 6))
         ttk.Label(lab, text="Current Label:").pack(side=tk.LEFT)
         ttk.Radiobutton(lab, text="FG(대상)", variable=self.current_label, value="FG").pack(side=tk.LEFT, padx=2)
         ttk.Radiobutton(lab, text="BG(배경)", variable=self.current_label, value="BG").pack(side=tk.LEFT, padx=2)
-
-        # ---- BBox 모드 토글 + 현재 이미지용 초기화 버튼 ----
-        ttk.Checkbutton(lab, text="BBox Mode (drag)", variable=self.bbox_mode).pack(side=tk.LEFT, padx=10)
-        ttk.Button(lab, text="Clear BBoxes (this image)", command=self.on_clear_bboxes_this_image).pack(side=tk.LEFT, padx=4)
-
         ttk.Button(lab, text="Undo last", command=self.on_undo).pack(side=tk.LEFT, padx=10)
         ttk.Button(lab, text="Clear points (this image)", command=self.on_clear_current_points).pack(side=tk.LEFT, padx=2)
 
+        ttk.Separator(lab, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+
+        # BBox 관련 버튼 (2행)
+        ttk.Button(lab, text="BBox Mode", command=self.on_toggle_bbox_mode).pack(side=tk.LEFT, padx=4)
+        ttk.Button(lab, text="Clear Bboxes (this image)", command=self.on_clear_bboxes_current_image).pack(side=tk.LEFT, padx=4)
+
+        # ------ 오버레이 슬라이더 & Clear ------
         ol = ttk.Frame(self.master); ol.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 6))
         ttk.Label(ol, text="Overlay Transparency (%)").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Scale(ol, from_=10.0, to=100.0, variable=self.overlay_transp, command=lambda e: self._redraw()
-                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Scale(ol, from_=10.0, to=100.0, variable=self.overlay_transp,
+                  command=lambda e: self._redraw()).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         ttk.Button(ol, text="Clear Cls. Results", command=self.on_clear_cls).pack(side=tk.LEFT, padx=8)
 
+        # ------ 캔버스 ------
         self.canvas = tk.Canvas(self.master, bg="#222222", width=CANVAS_W, height=CANVAS_H)
         self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         # 마우스/키 바인딩
-        self.canvas.bind("<Button-1>", self.on_left_click)
-        self.canvas.bind("<ButtonRelease-1>", self.on_b1_up)
-        self.canvas.bind("<B1-Motion>", self.on_b1_motion)
-        self.canvas.bind("<Button-3>", self.on_right_click)
+        self.canvas.bind("<Button-1>", self.on_left_click)    # 좌클릭: 샘플 / (BBox 모드면 드래그 시작)
+        self.canvas.bind("<B1-Motion>", self.on_left_drag)    # BBox 드래그 중
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_release)  # BBox 드래그 종료 & 확정
+        self.canvas.bind("<Button-3>", self.on_right_click)   # 우클릭: BG 샘플
         self.master.bind("f", lambda e: self.current_label.set("FG"))
         self.master.bind("b", lambda e: self.current_label.set("BG"))
+
         # 휠(Windows/Mac)
         self.master.bind("<MouseWheel>", self.on_wheel_zoom)
         # 리눅스
@@ -386,8 +394,6 @@ class App:
         self.img_bgr = img
         self.last_mask = None; self.last_contours = []
         self.curr_fg.clear(); self.curr_bg.clear()
-        self.bbox_history.clear()  # 이미지 변경 시 BBox 프리뷰 초기화
-        self.bbox_dragging = False
         self._update_counts()
 
         # 보기 초기화
@@ -415,16 +421,19 @@ class App:
         lb = tk.Listbox(frm, selectmode=tk.SINGLE)
         lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
+        # 스크롤
         sb = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=lb.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         lb.config(yscrollcommand=sb.set)
 
+        # 목록 채우기
         for i, p in enumerate(self.image_paths, start=1):
             mark = "  "
             if (i-1) == self.idx:
                 mark = "▶ "
             lb.insert(tk.END, f"{mark}{i:03d}  {p.name}")
 
+        # 현재 idx 선택
         lb.selection_set(self.idx)
         lb.see(self.idx)
 
@@ -436,6 +445,7 @@ class App:
             self._load_image(new_idx)
             win.destroy()
 
+        # 더블클릭 선택
         lb.bind("<Double-Button-1>", on_select)
 
         btns = ttk.Frame(win)
@@ -480,40 +490,26 @@ class App:
         cy = int(self.center_xy[1] * H * disp_scale)
         top_left_x = int(-cx + CANVAS_W // 2)
         top_left_y = int(-cy + CANVAS_H // 2)
-
-        # 1) 원본 이미지
         self.canvas.create_image(top_left_x, top_left_y, image=self.tk_img, anchor=tk.NW)
 
-        # 2) 오버레이(분류 결과) - 먼저 올림
+        # 오버레이(분류 결과 + 붉은 윤곽)
         if self.last_mask is not None:
             transp = float(self.overlay_transp.get())
-            alpha = 1.0 - max(10.0, min(100.0, transp)) / 100.0
+            alpha = 1.0 - max(10.0, min(100.0, transp)) / 100.0  # 10%→0.9, 100%→0.0
             overlay = self._make_overlay_with_contours(self.img_bgr, self.last_mask, alpha, self.last_contours)
             overlay = cv2.resize(overlay, (resized.shape[1], resized.shape[0]), interpolation=cv2.INTER_NEAREST)
             self.tk_overlay = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)))
             self.canvas.create_image(top_left_x, top_left_y, image=self.tk_overlay, anchor=tk.NW)
 
-        # 3) 과거 BBox 프리뷰(항상 오버레이 위에 보이도록 여기서 그림)
-        for (x1, y1, x2, y2, cls_str) in self.bbox_history:
-            x1c, y1c = self._image_to_canvas(x1, y1)
-            x2c, y2c = self._image_to_canvas(x2, y2)
-            color = "#00FFFF" if cls_str == "FG" else "#FF00FF"
-            self.canvas.create_rectangle(x1c, y1c, x2c, y2c, outline=color, width=2)
-
-        # 4) 드래그 중인 임시 BBox(오버레이+과거BBox 위에)
-        if self.bbox_dragging:
-            x1, y1 = self.bbox_start
-            x2, y2 = self.bbox_end
-            x1c, y1c = self._image_to_canvas(x1, y1)
-            x2c, y2c = self._image_to_canvas(x2, y2)
-            color = "#00FFFF" if self.current_label.get() == "FG" else "#FF00FF"
-            self.canvas.create_rectangle(x1c, y1c, x2c, y2c, outline=color, width=2, dash=(4,2))
-
-        # 5) 포인트 시각화(최상단)
+        # 포인트 시각화
         for (x, y) in self.curr_fg:
             self._draw_dot(x, y, "#00FF00")
         for (x, y) in self.curr_bg:
             self._draw_dot(x, y, "#FF5555")
+
+        # --- BBox들 표시 (영구 박스 + 드래그 중 임시 박스) ---
+        self._draw_all_bboxes()
+        self._draw_temp_bbox()
 
     def _draw_dot(self, x: int, y: int, color: str):
         cx, cy = self._image_to_canvas(x, y)
@@ -526,13 +522,14 @@ class App:
         green = np.zeros_like(base); green[:] = (0, 255, 0)
         m3 = (mask01 > 0).astype(np.float32)[..., None]
         out = (base * (1 - alpha * m3) + green * (alpha * m3)).astype(np.uint8)
+        # 붉은색 윤곽(선 두께 1px)
         if contours:
             cv2.drawContours(out, contours, -1, (0, 0, 255), 1)
         return out
 
     # ---------- 이벤트 ----------
     def on_left_click(self, e):
-        # Ctrl+좌클릭 → 팬
+        # Ctrl+클릭 → 팬(해당 지점을 중앙에 두기)
         if (e.state & 0x0004) != 0:
             xi, yi = self._canvas_to_image(e.x, e.y)
             if xi is None: return
@@ -542,24 +539,25 @@ class App:
             return
 
         if self.img_bgr is None: return
-        xi, yi = self._canvas_to_image(e.x, e.y)
-        if xi is None: return
 
-        # BBox 모드: 드래그 시작
+        # --- BBox 모드: 드래그 시작 ---
         if self.bbox_mode.get():
-            self.bbox_dragging = True
-            self.bbox_start = (xi, yi)
-            self.bbox_end = (xi, yi)
+            xi, yi = self._canvas_to_image(e.x, e.y)
+            if xi is None: return
+            self.bbox_start_xy = (xi, yi)
+            self.bbox_curr_xy = (xi, yi)
             self._redraw()
             return
 
-        # 포인트 샘플 모드
+        # --- 포인트 샘플링(기존 동작) ---
+        xi, yi = self._canvas_to_image(e.x, e.y)
+        if xi is None: return
         if self.current_label.get() == "FG":
             self.curr_fg.append((xi, yi)); ylab = 1; cls_str = "FG"
         else:
             self.curr_bg.append((xi, yi)); ylab = 0; cls_str = "BG"
 
-        feat = feature_at_xy(self.img_bgr, xi, yi)  # (1,11)
+        feat = feature_at_xy(self.img_bgr, xi, yi)  # (1,9)
         self.X_list.append(feat[0].copy()); self.y_list.append(ylab)
         b, g, r = self.img_bgr[yi, xi].tolist()
         self.RGB_list.append((int(r), int(g), int(b)))
@@ -567,83 +565,56 @@ class App:
         self.data_roles.append(self._assign_role_for_index(len(self.X_list)-1))
         self._update_counts(); self._redraw()
 
-    def on_b1_motion(self, e):
-        if not self.bbox_mode.get() or not self.bbox_dragging:
+    def on_left_drag(self, e):
+        if not self.bbox_mode.get():
+            return
+        if self.img_bgr is None or self.bbox_start_xy is None:
             return
         xi, yi = self._canvas_to_image(e.x, e.y)
-        if xi is None: return
-        self.bbox_end = (xi, yi)
+        if xi is None:
+            return
+        self.bbox_curr_xy = (xi, yi)
         self._redraw()
 
-    def on_b1_up(self, e):
-        if not self.bbox_mode.get() or not self.bbox_dragging:
+    def on_left_release(self, e):
+        if not self.bbox_mode.get():
             return
-        self.bbox_dragging = False
-        x2, y2 = self._canvas_to_image(e.x, e.y)
-        if x2 is None:
-            self._redraw()
+        if self.img_bgr is None or self.bbox_start_xy is None or self.bbox_curr_xy is None:
             return
-        x1, y1 = self.bbox_start
-        x1, x2 = sorted([x1, x2]); y1, y2 = sorted([y1, y2])
-        if x2 - x1 < 1 or y2 - y1 < 1:
-            self._redraw()
-            return
+        (x0, y0) = self.bbox_start_xy
+        (x1, y1) = self.bbox_curr_xy
 
-        # 박스 내부 픽셀 좌표
-        xs = np.arange(x1, x2+1)
-        ys = np.arange(y1, y2+1)
-        xx, yy = np.meshgrid(xs, ys)
-        coords = np.stack([xx.ravel(), yy.ravel()], axis=1)  # (N,2)
-
-        # Subsample 옵션
-        if self.bbox_subsample_enable.get():
-            ratio = max(0.0, min(1.0, float(self.bbox_subsample_ratio.get())))
-            if ratio < 1.0:
-                n = coords.shape[0]
-                k = int(round(n * ratio))
-                if k < 1:
-                    k = 1
-                idxs = np.random.choice(n, size=k, replace=False)
-                coords = coords[idxs]
-
-        # 특징 생성
-        feats = []
-        rgbs = []
-        for (x, y) in coords:
-            feats.append(feature_at_xy(self.img_bgr, int(x), int(y))[0])
-            b, g, r = self.img_bgr[int(y), int(x)].tolist()
-            rgbs.append([int(r), int(g), int(b)])
-        feats = np.asarray(feats, dtype=np.float32)
-        rgbs = np.asarray(rgbs, dtype=np.int32)
-
-        if feats.size == 0:
+        # 좌표 정리 & 너무 작은 박스는 무시
+        H, W = self.img_bgr.shape[:2]
+        xa, xb = int(max(0, min(x0, x1))), int(min(W-1, max(x0, x1)))
+        ya, yb = int(max(0, min(y0, y1))), int(min(H-1, max(y0, y1)))
+        if xb - xa < 2 or yb - ya < 2:
+            self.bbox_start_xy = None
+            self.bbox_curr_xy = None
             self._redraw()
             return
 
-        cls_str = self.current_label.get()
-        ylab = 1 if cls_str == "FG" else 0
+        # 이미지별 박스 목록에 저장
+        key = self.image_paths[self.idx].name if self.image_paths else None
+        if key is not None:
+            self.bboxes_per_image.setdefault(key, []).append((xa, ya, xb, yb))
 
-        n_add = feats.shape[0]
-        for i in range(n_add):
-            self.X_list.append(feats[i])
-            self.y_list.append(ylab)
-            self.RGB_list.append(tuple(rgbs[i]))
-            self.Cls_list.append(cls_str)
-            self.data_roles.append(self._assign_role_for_index(len(self.X_list)-1))
+        # 데이터셋에 샘플 추가
+        self._add_samples_from_bbox(xa, ya, xb, yb)
 
-        # 히스토리 기록(프리뷰 유지)
-        self.bbox_history.append((x1, y1, x2, y2, cls_str))
+        # 임시 상태 초기화
+        self.bbox_start_xy = None
+        self.bbox_curr_xy = None
 
-        self._update_counts()
+        # 다시 그리기(프리뷰에 박스 유지)
         self._redraw()
-        messagebox.showinfo("BBox", f"{cls_str} 샘플 {n_add}개 추가됨.")
 
     def on_right_click(self, e):
         if self.img_bgr is None: return
         xi, yi = self._canvas_to_image(e.x, e.y)
         if xi is None: return
         self.curr_bg.append((xi, yi))
-        feat = feature_at_xy(self.img_bgr, xi, yi)
+        feat = feature_at_xy(self.img_bgr, xi, yi)  # (1,9)
         self.X_list.append(feat[0].copy()); self.y_list.append(0)
         b, g, r = self.img_bgr[yi, xi].tolist()
         self.RGB_list.append((int(r), int(g), int(b))); self.Cls_list.append("BG")
@@ -651,7 +622,7 @@ class App:
         self._update_counts(); self._redraw()
 
     def on_wheel_zoom(self, e):
-        if (e.state & 0x0004) == 0:
+        if (e.state & 0x0004) == 0:  # Ctrl 없는 휠은 무시
             return
         factor = 1.1 if e.delta > 0 else (1 / 1.1)
         self._apply_zoom(factor, e.x, e.y)
@@ -704,13 +675,6 @@ class App:
         self.curr_fg.clear(); self.curr_bg.clear()
         self._update_counts(); self._redraw()
 
-    def on_clear_bboxes_this_image(self):
-        if not self.bbox_history:
-            return
-        if messagebox.askyesno("확인", "현재 이미지에서 그린 모든 BBox 프리뷰를 지울까요? (데이터셋에는 이미 반영됨)"):
-            self.bbox_history.clear()
-            self._redraw()
-
     def on_clear_cls(self):
         self.last_mask = None; self.last_contours = []
         self._redraw()
@@ -720,9 +684,15 @@ class App:
 
     # ---------- Dataset Split ----------
     def _assign_role_for_index(self, idx: int) -> str:
+        """
+        새 샘플이 추가될 때 어떤 용도로 쓸지 정해주는 함수.
+        - random_split == False → 들어온 순서대로 80:10:10
+        - random_split == True  → 나중에 on_dataset_split()으로 전체를 다시 섞을 거라 일단 TRAIN으로 넣어둔다
+        """
         if self.random_split:
             return "TRAIN"
-        n = idx + 1
+        # 순서 기준 배정
+        n = idx + 1  # 총 개수
         ratio = (idx) / max(1, n)
         if ratio < 0.8:
             return "TRAIN"
@@ -751,16 +721,16 @@ class App:
         for i in test_idx: roles[i] = "TEST"
         self.data_roles = roles
         self.random_split = True
-        messagebox.showinfo("완료", f"Dataset 무작위 분할\nTrain: {len(train_idx)} / Valid: {len(valid_idx)} / Test: {len(test_idx)}")
+        messagebox.showinfo("완료", f"Dataset이 무작위로 분할되었습니다.\nTrain: {len(train_idx)} / Valid: {len(valid_idx)} / Test: {len(test_idx)}")
 
     # ---------- 학습 ----------
     def on_train(self):
         if len(self.X_list) < 10 or len(set(self.y_list)) < 2:
-            messagebox.showwarning("경고", "학습을 위해 FG/BG 포인트를 더 추가하세요(최소 10개, 두 클래스 모두).")
+            messagebox.showwarning("경고", "학습을 위해 FG/BG 포인트/BBox 샘플을 더 추가하세요(최소 10개, 두 클래스 모두).")
             return
 
         X_train, y_train = self._get_subset("TRAIN")
-        _X_valid, _y_valid = self._get_subset("VALID")
+        X_valid, y_valid = self._get_subset("VALID")
         if len(X_train) < 5 or len(set(y_train)) < 2:
             messagebox.showwarning("경고", f"Train 세트가 부족합니다. (현재 Train={len(X_train)})")
             return
@@ -770,6 +740,7 @@ class App:
         epochs = max(1, int(self.epochs_var.get()))
         mname = self.model_type_var.get()
 
+        # 진행 팝업
         pop = tk.Toplevel(self.master); pop.title("Training...")
         lbl = ttk.Label(pop, text=f"{mname} | Epoch 0 / {epochs}"); lbl.pack(padx=12, pady=(12, 4))
         pb = ttk.Progressbar(pop, orient="horizontal", length=360, mode="determinate", maximum=epochs)
@@ -783,7 +754,7 @@ class App:
             pipe = Pipeline([("scaler", StandardScaler()), ("clf", SVC(kernel=kernel, C=3.0, gamma="scale"))])
             n = len(y)
             for ep in range(1, epochs + 1):
-                idxs = np.random.randint(0, n, size=n)
+                idxs = np.random.randint(0, n, size=n)  # 부트스트랩
                 pipe.fit(X[idxs], y[idxs])
                 pb["value"] = ep; lbl.config(text=f"{mname} | Epoch {ep} / {epochs}"); pop.update()
             self.model = pipe
@@ -800,31 +771,36 @@ class App:
             self.model = Pipeline([("scaler", scaler), ("clf", rf)])
             self.torch_model = None; self.torch_scaler = None
 
-        else:
+        else:  # MLP (PyTorch)
             if not TORCH_OK:
                 pop.destroy()
                 messagebox.showerror("오류", "PyTorch가 설치되어 있지 않습니다. pip install torch 로 설치하세요.")
                 return
+            # 스케일링
             scaler = StandardScaler().fit(X)
             Xs = scaler.transform(X).astype(np.float32)
             X_tensor = torch.from_numpy(Xs)
             y_tensor = torch.from_numpy(y.astype(np.int64))
 
+            # 아키텍처
             layers = max(1, int(self.mlp_layers_var.get()))
             neurons = self._parse_neurons(self.mlp_neurons_text.get(), layers)
             use_do = bool(self.mlp_use_dropout.get())
             do_rate = max(0.0, min(0.9, float(self.mlp_dropout_rate.get())))
-            model = MLPNet(input_dim=11, hidden_sizes=neurons, num_classes=2,
+            model = MLPNet(input_dim=9, hidden_sizes=neurons, num_classes=2,
                            use_dropout=use_do, dropout_rate=do_rate)
 
+            # 옵티마이저/로스
             optimizer = optim.Adam(model.parameters(), lr=1e-3)
             criterion = nn.CrossEntropyLoss()
 
             model.train()
-            B = min(256, max(16, len(y)//4))
+            B = min(256, max(16, len(y)//4))  # 간단 배치 크기
             for ep in range(1, epochs+1):
+                # 셔플
                 idxs = np.random.permutation(len(y))
                 Xb = X_tensor[idxs]; yb = y_tensor[idxs]
+                # 미니배치
                 for i in range(0, len(y), B):
                     xb = Xb[i:i+B]; ybt = yb[i:i+B]
                     optimizer.zero_grad()
@@ -836,7 +812,7 @@ class App:
 
             self.torch_model = model.eval()
             self.torch_scaler = scaler
-            self.model = None
+            self.model = None  # sklearn 파이프라인 비활성
 
         self.is_trained = True
         self.last_train_date = datetime.now().strftime("%Y%m%d")
@@ -857,6 +833,7 @@ class App:
         return parts
 
     def _get_subset(self, role: str):
+        """role: 'TRAIN'|'VALID'|'TEST'"""
         Xs = []
         ys = []
         for x, y, r in zip(self.X_list, self.y_list, self.data_roles):
@@ -874,25 +851,29 @@ class App:
             messagebox.showwarning("경고", "먼저 Train 또는 Load Weights를 수행하세요.")
             return
 
-        feats = extract_features_image(self.img_bgr)
+        feats = extract_features_image(self.img_bgr)  # (H*W, 9)
         try:
             if mname == "MLP (PyTorch)" or (self.torch_model is not None and self.model is None):
+                # Torch 경로
                 Xs = self.torch_scaler.transform(feats).astype(np.float32)
                 with torch.no_grad():
                     logits = self.torch_model(torch.from_numpy(Xs))
                     pred = torch.argmax(logits, dim=1).cpu().numpy().astype(np.uint8)
             else:
+                # sklearn 경로
                 pred = self.model.predict(feats).astype(np.uint8)
         except Exception as e:
             messagebox.showerror("오류", f"분류 실패: {e}")
             return
 
         H, W = self.img_bgr.shape[:2]
-        mask = pred.reshape(H, W)
+        mask = pred.reshape(H, W)  # 1=FG, 0=BG
 
+        # 모폴로지 후처리(옵션에서 설정한 값 사용)
         mask_post = postprocess_mask(mask, self.morph_kernel_size, self.morph_open_iter, self.morph_close_iter)
         self.last_mask = mask_post
 
+        # 정교한 외곽 컨투어 보관(옵션 반영)
         self.last_contours = find_outer_contours(
             mask_post,
             epsilon_px=float(self.poly_epsilon_px.get()),
@@ -909,6 +890,7 @@ class App:
             messagebox.showwarning("경고", "Classify 후 Export 할 수 있습니다.")
             return
         H, W = self.img_bgr.shape[:2]
+        # 현재 옵션으로 다시 추출(일관성)
         contours = find_outer_contours(
             self.last_mask,
             epsilon_px=float(self.poly_epsilon_px.get()),
@@ -931,6 +913,7 @@ class App:
             messagebox.showerror("오류", f"YOLO 라벨 저장 실패: {e}")
             return
 
+        # 프리뷰 저장(컨투어 붉은색)
         preview = self.img_bgr.copy()
         cv2.drawContours(preview, contours, -1, (0, 0, 255), 1)
         imwrite_unicode((self.output_dir / f"{img_path.stem}_preview.jpg"), preview)
@@ -955,7 +938,7 @@ class App:
             saveobj = {
                 "state_dict": self.torch_model.state_dict(),
                 "arch": {
-                    "input_dim": 11,
+                    "input_dim": 9,
                     "hidden_sizes": self._parse_neurons(self.mlp_neurons_text.get(), int(self.mlp_layers_var.get())),
                     "num_classes": 2,
                     "use_dropout": bool(self.mlp_use_dropout.get()),
@@ -1000,7 +983,7 @@ class App:
                 messagebox.showerror("오류", f"불러오기 실패: {e}"); return
             arch = payload.get("arch", {})
             model = MLPNet(
-                input_dim=int(arch.get("input_dim", 11)),
+                input_dim=int(arch.get("input_dim", 9)),
                 hidden_sizes=list(arch.get("hidden_sizes", [10,10,10])),
                 num_classes=int(arch.get("num_classes", 2)),
                 use_dropout=bool(arch.get("use_dropout", True)),
@@ -1018,6 +1001,7 @@ class App:
             self.model_type_var.set(meta.get("model_type", "MLP (PyTorch)"))
             self.epochs_var.set(int(meta.get("epochs", self.epochs_var.get())))
             self.last_train_date = meta.get("date", datetime.now().strftime("%Y%m%d"))
+            # Option 창 표시값도 동기화
             self.mlp_layers_var.set(len(arch.get("hidden_sizes", [10,10,10])))
             self.mlp_neurons_text.set(",".join(str(int(n)) for n in arch.get("hidden_sizes", [10,10,10])))
             self.mlp_use_dropout.set(bool(arch.get("use_dropout", True)))
@@ -1052,6 +1036,7 @@ class App:
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
+                # Set 컬럼 포함
                 w.writerow(["IDX", "R", "G", "B", "Cls", "Set"])
                 for i, ((r, g, b), cls, role) in enumerate(zip(self.RGB_list, self.Cls_list, self.data_roles), start=1):
                     w.writerow([i, r, g, b, cls, role])
@@ -1074,7 +1059,8 @@ class App:
                     cls = row["Cls"].strip().upper()
                     ylab = 1 if cls == "FG" else 0
                     hsv, lab = hsv_lab_from_rgb(r, g, b)
-                    feat = np.array([[b, g, r, hsv[0], hsv[1], hsv[2], lab[0], lab[1], lab[2], 0.5, 0.5]], dtype=np.float32)
+                    feat = np.array([[b, g, r, hsv[0], hsv[1], hsv[2], lab[0], lab[1], lab[2]]],
+                                    dtype=np.float32)  # 9D
                     self.X_list.append(feat[0]); self.y_list.append(ylab)
                     self.RGB_list.append((r, g, b)); self.Cls_list.append("FG" if ylab==1 else "BG")
                     role = row.get("Set", "").strip().upper()
@@ -1087,9 +1073,9 @@ class App:
         self._update_counts()
         messagebox.showinfo("완료", f"로딩된 항목: {loaded}")
 
-    # ---------- 옵션(모폴로지 + 컨투어 + MLP + BBox) ----------
+    # ---------- 옵션(모폴로지 + 컨투어 정교화 + MLP + BBox Sampling) ----------
     def on_option(self):
-        win = tk.Toplevel(self.master); win.title("Options")
+        win = tk.Toplevel(self.master); win.title("Options (Morphology, Contour, MLP, BBox)")
         frm = ttk.Frame(win); frm.pack(padx=12, pady=12)
 
         # ---- Morphology
@@ -1153,40 +1139,46 @@ class App:
         do_rate_var = tk.DoubleVar(value=float(self.mlp_dropout_rate.get()))
         ttk.Spinbox(frm, from_=0.0, to=0.9, increment=0.01, textvariable=do_rate_var, width=6).grid(row=16, column=1, padx=4, pady=4)
 
-        # ---- BBox 옵션
+        # ---- BBox Sampling ----
         ttk.Separator(frm, orient=tk.HORIZONTAL).grid(row=17, column=0, columnspan=2, sticky="ew", pady=8)
         ttk.Label(frm, text="BBox Sampling").grid(row=18, column=0, sticky="w", padx=4, pady=(0,4), columnspan=2)
 
-        ttk.Label(frm, text="Use Subsample (ratio):").grid(row=19, column=0, sticky="e", padx=4, pady=4)
-        subs_en_var = tk.BooleanVar(value=bool(self.bbox_subsample_enable.get()))
-        subs_ratio_var = tk.DoubleVar(value=float(self.bbox_subsample_ratio.get()))
-        ttk.Checkbutton(frm, variable=subs_en_var).grid(row=19, column=1, sticky="w", padx=4, pady=4)
+        ttk.Label(frm, text="Use All Pixels:").grid(row=19, column=0, sticky="e", padx=4, pady=4)
+        use_all_var = tk.BooleanVar(value=bool(self.bbox_use_all_pixels.get()))
+        ttk.Checkbutton(frm, variable=use_all_var).grid(row=19, column=1, sticky="w", padx=4, pady=4)
 
-        ttk.Label(frm, text="Ratio (0~1):").grid(row=20, column=0, sticky="e", padx=4, pady=4)
-        ttk.Spinbox(frm, from_=0.0, to=1.0, increment=0.05, textvariable=subs_ratio_var, width=6).grid(row=20, column=1, padx=4, pady=4)
+        ttk.Label(frm, text="Subsample ratio (0~1):").grid(row=20, column=0, sticky="e", padx=4, pady=4)
+        ratio_var = tk.DoubleVar(value=float(self.bbox_subsample_ratio.get()))
+        ttk.Spinbox(frm, from_=0.0, to=1.0, increment=0.05, textvariable=ratio_var, width=6).grid(row=20, column=1, padx=4, pady=4)
 
         def apply_and_close():
             # Morph
-            ks = int(ks_var.get());  ks = ks + (ks % 2 == 0)
+            ks = int(ks_var.get())
+            if ks % 2 == 0: ks += 1
             self.morph_kernel_size = max(3, ks)
             self.morph_open_iter = max(0, int(op_var.get()))
             self.morph_close_iter = max(0, int(cl_var.get()))
+
             # Contour
             self.chain_approx_mode.set(ca_var.get())
             eps = float(eps_var.get())
             self.poly_epsilon_px.set(max(0.0, min(10.0, eps)))
             self.cnt_blur_enable.set(bool(blur_enable_var.get()))
             self.cnt_blur_method.set(blur_method_var.get())
-            k2 = int(blur_ksize_var.get()); k2 = k2 + (k2 % 2 == 0)
+            k2 = int(blur_ksize_var.get())
+            if k2 % 2 == 0: k2 += 1
             self.cnt_blur_ksize.set(max(3, k2))
+
             # MLP
             self.mlp_layers_var.set(max(1, int(layers_var.get())))
             self.mlp_neurons_text.set(neurons_var.get())
             self.mlp_use_dropout.set(bool(use_do_var.get()))
             self.mlp_dropout_rate.set(max(0.0, min(0.9, float(do_rate_var.get()))))
-            # BBox
-            self.bbox_subsample_enable.set(bool(subs_en_var.get()))
-            self.bbox_subsample_ratio.set(max(0.0, min(1.0, float(subs_ratio_var.get()))))
+
+            # BBox sampling
+            self.bbox_use_all_pixels.set(bool(use_all_var.get()))
+            self.bbox_subsample_ratio.set(max(0.0, min(1.0, float(ratio_var.get()))))
+
             win.destroy()
 
         btns = ttk.Frame(frm); btns.grid(row=21, column=0, columnspan=2, pady=(8,0))
@@ -1205,7 +1197,10 @@ class App:
             self.torch_model = None; self.torch_scaler = None
             self.last_mask = None; self.last_contours = []
             self.curr_fg.clear(); self.curr_bg.clear()
-            self.bbox_history.clear(); self.bbox_dragging = False
+            # BBox도 함께 초기화
+            self.bboxes_per_image.clear()
+            self.bbox_start_xy = None
+            self.bbox_curr_xy = None
             self._update_counts(); self._redraw()
             messagebox.showinfo("완료", "누적 데이터셋이 초기화되었습니다. 새로 샘플링하세요.")
 
@@ -1220,6 +1215,7 @@ class App:
             messagebox.showwarning("경고", "Test 세트가 없습니다. Dataset Split을 하거나 일부 샘플을 Test로 지정하세요.")
             return
 
+        # 예측
         mname = self.model_type_var.get()
         try:
             if mname == "MLP (PyTorch)" or (self.torch_model is not None and self.model is None):
@@ -1235,6 +1231,7 @@ class App:
 
         y_true = np.array(y_test, dtype=np.int32)
 
+        # 지표 계산 (이진 FG(1) / BG(0))
         tp = int(np.sum((y_true == 1) & (y_pred == 1)))
         tn = int(np.sum((y_true == 0) & (y_pred == 0)))
         fp = int(np.sum((y_true == 0) & (y_pred == 1)))
@@ -1244,8 +1241,12 @@ class App:
         acc = (tp + tn) / total if total else 0.0
         prec = tp / (tp + fp) if (tp + fp) else 0.0
         rec = tp / (tp + fn) if (tp + fn) else 0.0
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        if (prec + rec) > 0:
+            f1 = 2 * prec * rec / (prec + rec)
+        else:
+            f1 = 0.0
 
+        # 팝업으로 표시
         win = tk.Toplevel(self.master); win.title("Model Evaluation (Test set)")
         frm = ttk.Frame(win); frm.pack(padx=12, pady=12)
 
@@ -1263,6 +1264,110 @@ class App:
         ttk.Label(frm, text=f"F1-score : {f1:.4f}").grid(row=9, column=0, columnspan=2, sticky="w", pady=2)
 
         ttk.Button(frm, text="Close", command=win.destroy).grid(row=10, column=0, columnspan=2, pady=(10,0))
+
+    # ---------- BBox: 토글 & 클리어 ----------
+    def on_toggle_bbox_mode(self):
+        now = not self.bbox_mode.get()
+        self.bbox_mode.set(now)
+        try:
+            self.canvas.config(cursor="tcross" if now else "")
+        except Exception:
+            pass
+        self.bbox_start_xy = None
+        self.bbox_curr_xy = None
+        self._redraw()
+
+    def on_clear_bboxes_current_image(self):
+        if not self.image_paths:
+            return
+        key = self.image_paths[self.idx].name
+        if key in self.bboxes_per_image:
+            del self.bboxes_per_image[key]
+        self._redraw()
+
+    # ---------- BBox: 드로잉 도우미 ----------
+    def _draw_bbox_rect(self, x1, y1, x2, y2, color="#00FFFF", dash=None, width=2):
+        x1c, y1c = self._image_to_canvas(x1, y1)
+        x2c, y2c = self._image_to_canvas(x2, y2)
+        if dash is not None:
+            self.canvas.create_rectangle(x1c, y1c, x2c, y2c, outline=color, width=width, dash=dash)
+        else:
+            self.canvas.create_rectangle(x1c, y1c, x2c, y2c, outline=color, width=width)
+
+    def _draw_all_bboxes(self):
+        if self.img_bgr is None or not self.image_paths:
+            return
+        key = self.image_paths[self.idx].name
+        bboxes = self.bboxes_per_image.get(key, [])
+        for (x1, y1, x2, y2) in bboxes:
+            self._draw_bbox_rect(x1, y1, x2, y2, color="#00FFFF", width=2)
+
+    def _draw_temp_bbox(self):
+        if self.img_bgr is None:
+            return
+        if self.bbox_start_xy is None or self.bbox_curr_xy is None:
+            return
+        (x0, y0) = self.bbox_start_xy
+        (x1, y1) = self.bbox_curr_xy
+        self._draw_bbox_rect(x0, y0, x1, y1, color="#FFD700", dash=(4, 3), width=2)
+
+    # ---------- BBox: 샘플링 로직 ----------
+    def _add_samples_from_bbox(self, x1, y1, x2, y2):
+        """
+        BBox 내부 픽셀들의 특징(9D: BGR+HSV+Lab)을 벡터화로 추출하여 X/y에 누적.
+        옵션에 따라 전체 픽셀 또는 서브샘플링 사용.
+        """
+        if self.img_bgr is None:
+            return
+
+        H, W = self.img_bgr.shape[:2]
+        xa, xb = int(max(0, min(x1, x2))), int(min(W-1, max(x1, x2)))
+        ya, yb = int(max(0, min(y1, y2))), int(min(H-1, max(y1, y2)))
+        if xb <= xa or yb <= ya:
+            return  # 면적 없음
+
+        # 패치 추출
+        patch_bgr = self.img_bgr[ya:yb+1, xa:xb+1, :]
+        patch_hsv = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
+        patch_lab = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2Lab)
+
+        h, w = patch_bgr.shape[:2]
+        n = h * w
+
+        # --- 샘플링 인덱스 선택 ---
+        if self.bbox_use_all_pixels.get():
+            idxs = np.arange(n, dtype=np.int64)
+        else:
+            ratio = float(self.bbox_subsample_ratio.get())
+            ratio = max(0.0, min(1.0, ratio))
+            k = int(round(n * ratio))
+            if k <= 0:
+                return
+            idxs = np.random.choice(n, size=k, replace=False)
+
+        # --- 특징 벡터 구성 (9D) ---
+        bgr_flat = patch_bgr.reshape(-1, 3).astype(np.float32)[idxs]
+        hsv_flat = patch_hsv.reshape(-1, 3).astype(np.float32)[idxs]
+        lab_flat = patch_lab.reshape(-1, 3).astype(np.float32)[idxs]
+        feats = np.concatenate([bgr_flat, hsv_flat, lab_flat], axis=1)   # (m, 9)
+
+        # 라벨/색상/문자
+        ylab = 1 if self.current_label.get() == "FG" else 0
+        cls_str = "FG" if ylab == 1 else "BG"
+
+        # RGB(R,G,B) 저장 (bgr_flat는 B,G,R 순서)
+        rgb_flat = np.stack([bgr_flat[:, 2], bgr_flat[:, 1], bgr_flat[:, 0]], axis=1).astype(np.int32)
+
+        # 누적 추가
+        m = feats.shape[0]
+        for i in range(m):
+            self.X_list.append(feats[i].copy())
+            self.y_list.append(ylab)
+            self.RGB_list.append((int(rgb_flat[i, 0]), int(rgb_flat[i, 1]), int(rgb_flat[i, 2])))
+            self.Cls_list.append(cls_str)
+            self.data_roles.append(self._assign_role_for_index(len(self.X_list) - 1))
+
+        self._update_counts()
 
 # --------------- main ---------------
 def main():
